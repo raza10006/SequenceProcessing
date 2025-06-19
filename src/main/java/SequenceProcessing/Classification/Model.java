@@ -57,18 +57,17 @@ public abstract class Model implements Serializable {
             corpus.shuffleSentences(parameters.getSeed());
             for (int j = 0; j < corpus.sentenceCount(); j++) {
                 Sentence sentence = corpus.getSentence(j);
-                for (int k = 0; k < sentence.wordCount(); k++) {
-                    calculateOutput(sentence, k);
-                    backpropagation(sentence, k, learningRate);
-                    clear();
-                }
+                calculateSentence(sentence, learningRate);
                 clearOldValues();
             }
             learningRate *= parameters.getEtaDecrease();
         }
     }
 
-    protected void createInputVector(LabelledVectorizedWord word) {
+    protected abstract void calculateSentence(Sentence sentence, double learningRate) throws MatrixDimensionMismatch, MatrixRowColumnMismatch;
+
+    protected void createInputVector(Sentence sentence, int index) {
+        LabelledVectorizedWord word = (LabelledVectorizedWord) sentence.getWord(index);
         for (int i = 0; i < layers.get(0).getRow(); i++) {
             layers.get(0).setValue(i,0, word.getVector().getValue(i));
         }
@@ -201,8 +200,6 @@ public abstract class Model implements Serializable {
     }
 
     protected abstract void calculateOutput(Sentence sentence, int index) throws MatrixRowColumnMismatch, MatrixDimensionMismatch;
-
-    protected abstract void backpropagation(Sentence sentence, int index, double learningRate) throws MatrixRowColumnMismatch, MatrixDimensionMismatch;
 
     public ArrayList<String> predict(Sentence sentence) throws MatrixRowColumnMismatch, MatrixDimensionMismatch {
         ArrayList<String> classLabels = new ArrayList<>();
