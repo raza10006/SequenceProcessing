@@ -1,56 +1,171 @@
 package SequenceProcessing.Classification;
 
-import Corpus.Sentence;
-import SequenceProcessing.Sequence.LabelledVectorizedWord;
+import Classification.Parameter.Parameter;
+import Classification.Performance.ClassificationPerformance;
+import ComputationalGraph.*;
 
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Random;
 
 import Math.*;
+import SequenceProcessing.Functions.RemoveBias;
+import SequenceProcessing.Functions.Switch;
+import SequenceProcessing.Parameters.*;
 
-public class RecurrentNeuralNetworkModel extends Model implements Serializable {
+public class RecurrentNeuralNetworkModel extends ComputationalGraph implements Serializable {
 
-    @Override
-    protected void calculateSentence(Sentence sentence, double learningRate) throws MatrixDimensionMismatch, MatrixRowColumnMismatch {
-        for (int k = 0; k < sentence.wordCount(); k++) {
-            calculateOutput(sentence, k);
-            LabelledVectorizedWord word = (LabelledVectorizedWord) sentence.getWord(k);
-            Matrix rMinusY = calculateRMinusY(word);
-            rMinusY.multiplyWithConstant(learningRate);
-            ArrayList<Matrix> deltaWeights = new ArrayList<>();
-            ArrayList<Matrix> deltaRecurrentWeights = new ArrayList<>();
-            deltaWeights.add(rMinusY.multiply(layers.get(layers.size() - 2).transpose()));
-            deltaWeights.add(rMinusY);
-            deltaRecurrentWeights.add(rMinusY);
-            for (int l = parameters.layerSize() - 1; l >= 0; l--) {
-                Matrix delta = deltaWeights.get(deltaWeights.size() - 1).transpose().multiply(weights.get(l + 1).partial(0, weights.get(l + 1).getRow() - 1, 0, weights.get(l + 1).getColumn() - 2)).elementProduct(derivative(layers.get(l + 1).partial(0, layers.get(l + 1).getRow() - 2, 0, layers.get(l + 1).getColumn() - 1), this.activationFunction).transpose()).transpose();
-                deltaWeights.set(deltaWeights.size() - 1, delta.multiply(layers.get(l).transpose()));
-                deltaRecurrentWeights.set(deltaRecurrentWeights.size() - 1, delta.multiply(oldLayers.get(l).transpose()));
-                if (l > 0) {
-                    deltaWeights.add(delta);
-                    deltaRecurrentWeights.add(delta);
+    private final int wordEmbeddingLength;
+    private final ArrayList<Switch> switches;
+
+    public RecurrentNeuralNetworkModel(int wordEmbeddingLength) {
+        this.wordEmbeddingLength = wordEmbeddingLength;
+        this.switches = new ArrayList<>();
+    }
+
+    private void createInputTensors(Tensor instance, ArrayList<Integer> classLabels) {
+        int timeStep = (instance.getShape()[0] / (wordEmbeddingLength + 1));
+        int j = 0;
+        for (int i = 0; i < this.inputNodes.size(); i++) {
+            if (i < timeStep) {
+                this.switches.get(i).setTurn(true);
+                ArrayList<Double> values = new ArrayList<>();
+                for (int k = 0; k < wordEmbeddingLength; k++) {
+                    values.add(instance.getValue(new int[]{j}));
+                    j++;
                 }
+                classLabels.add((int) instance.getValue(new int[]{j}));
+                j++;
+                inputNodes.get(i).setValue(new Tensor(values, new int[]{1, values.size()}));
+            } else {
+                this.switches.get(i).setTurn(false);
+                ArrayList<Double> values = new ArrayList<>();
+                for (int k = 0; k < wordEmbeddingLength; k++) {
+                    values.add(0.0);
+                    j++;
+                }
+                classLabels.add(0);
+                j++;
+                inputNodes.get(i).setValue(new Tensor(values, new int[]{1, values.size()}));
             }
-            weights.get(weights.size() - 1).add(deltaWeights.get(0));
-            deltaWeights.remove(0);
-            for (int l = 0; l < deltaWeights.size(); l++) {
-                weights.get(weights.size() - l - 2).add(deltaWeights.get(l));
-                recurrentWeights.get(recurrentWeights.size() - l - 1).add(deltaRecurrentWeights.get(l));
+        }
+    }
+
+    // Many-to-Many RNN
+    @Override
+    public void train(ArrayList<Tensor> trainSet, Parameter parameters) {
+        Random random = new Random(1);
+        int timeStep = -1;
+        for (Tensor tensor : trainSet) {
+            int size = tensor.getShape()[0];
+            if (timeStep < size / (wordEmbeddingLength + 1)) {
+                timeStep = size / (wordEmbeddingLength + 1);
             }
-            clear();
+        }
+        ArrayList<ComputationalNode> weights = new ArrayList<>();
+        ArrayList<ComputationalNode> recurrentWeights = new ArrayList<>();
+        ArrayList<Double> data = new ArrayList<>();
+        int currentLength = wordEmbeddingLength + 1;
+        for (int i = 0; i < ((RecurrentNeuralNetworkParameter) parameters).size(); i++) {
+            data.clear();
+            for (int j = 0; j < currentLength * ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i); j++) {
+                data.add(-0.01 + (0.02 * random.nextDouble()));
+            }
+            weights.add(new MultiplicationNode(true, false, new Tensor(data, new int[]{currentLength, ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i)}), false));
+            data.clear();
+            for (int j = 0; j < ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i) * ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i); j++) {
+                data.add(-0.01 + (0.02 * random.nextDouble()));
+            }
+            recurrentWeights.add(new MultiplicationNode(true, false, new Tensor(data, new int[]{((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i), ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i)}), false));
+            currentLength = ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i) + 1;
+        }
+        data.clear();
+        for (int j = 0; j < currentLength * ((RecurrentNeuralNetworkParameter) parameters).getClassLabelSize(); j++) {
+            data.add(-0.01 + (0.02 * random.nextDouble()));
+        }
+        weights.add(new MultiplicationNode(true, false, new Tensor(data, new int[]{currentLength, ((RecurrentNeuralNetworkParameter) parameters).getClassLabelSize()}), false));
+        ArrayList<ComputationalNode> currentOldLayers = new ArrayList<>();
+        ArrayList<ComputationalNode> outputNodes = new ArrayList<>();
+        for (int k = 0; k < timeStep; k++) {
+            this.switches.add(new Switch());
+            ArrayList<ComputationalNode> newOldLayers = new ArrayList<>();
+            ComputationalNode input = new MultiplicationNode(false, true, false);
+            inputNodes.add(input);
+            ComputationalNode current = input;
+            for (int i = 0; i < ((RecurrentNeuralNetworkParameter) parameters).size(); i++) {
+                ComputationalNode aw;
+                ComputationalNode aFunction;
+                if (!currentOldLayers.isEmpty()) {
+                    aw = this.addEdge(current, weights.get(i), false);
+                    ComputationalNode oWithoutBias = this.addEdge(currentOldLayers.get(i), new RemoveBias(), false);
+                    ComputationalNode ou = this.addEdge(oWithoutBias, recurrentWeights.get(i), false);
+                    ComputationalNode a = this.addAdditionEdge(aw, ou, true);
+                    aFunction = this.addEdge(a, ((RecurrentNeuralNetworkParameter) parameters).getActivationFunction(i), false);
+                } else {
+                    aw = this.addEdge(current, weights.get(i), true);
+                    aFunction = this.addEdge(aw, ((RecurrentNeuralNetworkParameter) parameters).getActivationFunction(i), false);
+                }
+                current = this.addEdge(aFunction, switches.get(k), false);
+                newOldLayers.add(current);
+            }
+            currentOldLayers = (ArrayList<ComputationalNode>) newOldLayers.clone();
+            ComputationalNode output = this.addEdge(current, weights.get(weights.size() - 1), false);
+            outputNodes.add(this.addEdge(output, new Softmax(), false));
+        }
+        this.concatEdges(outputNodes, 0);
+        // Training
+        for (int i = 0; i < ((RecurrentNeuralNetworkParameter) parameters).getEpoch(); i++) {
+            System.out.println("Epoch: " + (i + 1));
+            // Shuffle
+            for (int j = 0; j < trainSet.size(); j++) {
+                int i1 = random.nextInt(trainSet.size());
+                int i2 = random.nextInt(trainSet.size());
+                Tensor tmp = trainSet.get(i1);
+                trainSet.set(i1, trainSet.get(i2));
+                trainSet.set(i2, tmp);
+            }
+            ArrayList<Integer> classLabels = new ArrayList<>();
+            for (Tensor instance : trainSet) {
+                createInputTensors(instance, classLabels);
+                this.forwardCalculation();
+                this.backpropagation(((RecurrentNeuralNetworkParameter) parameters).getLearningRate(), classLabels);
+                classLabels.clear();
+            }
+            ((RecurrentNeuralNetworkParameter) parameters).setLearningRate();
         }
     }
 
     @Override
-    protected void calculateOutput(Sentence sentence, int index) throws MatrixRowColumnMismatch, MatrixDimensionMismatch {
-        createInputVector(sentence, index);
-        for (int l = 0; l < this.layers.size() - 2; l++) {
-            layers.get(l + 1).add(this.recurrentWeights.get(l).multiply(oldLayers.get(l)));
-            layers.get(l + 1).add(this.weights.get(l).multiply(this.layers.get(l)));
-            layers.set(l + 1, activationFunction(layers.get(l + 1), this.activationFunction));
-            layers.set(l + 1, biased(layers.get(l + 1)));
+    protected ArrayList<Integer> getClassLabels(ComputationalNode outputNode) {
+        ArrayList<Integer> classLabels = new ArrayList<>();
+        for (int i = 0; i < outputNode.getValue().getShape()[0]; i++) {
+            int index = -1;
+            double max = Double.MIN_VALUE;
+            for (int j = 0; j < outputNode.getValue().getShape()[1]; j++) {
+                if (max < outputNode.getValue().getValue(new int[]{i, j})) {
+                    max = outputNode.getValue().getValue(new int[]{i, j});
+                    index = j;
+                }
+            }
+            classLabels.add(index);
         }
-        layers.get(layers.size() - 1).add(this.weights.get(this.weights.size() - 1).multiply(layers.get(layers.size() - 2)));
-        normalizeOutput();
+        return classLabels;
+    }
+
+    @Override
+    public ClassificationPerformance test(ArrayList<Tensor> testSet) {
+        int count = 0, total = 0;
+        for (Tensor instance : testSet) {
+            ArrayList<Integer> goldClassLabels = new ArrayList<>();
+            createInputTensors(instance, goldClassLabels);
+            ArrayList<Integer> classLabels = this.predict();
+            for (int j = 0; j < (instance.getShape()[0] / (wordEmbeddingLength + 1)); j++) {
+                if (goldClassLabels.get(j).equals(classLabels.get(j))) {
+                    count++;
+                }
+                total++;
+            }
+        }
+        return new ClassificationPerformance((count + 0.0) / total);
     }
 }
