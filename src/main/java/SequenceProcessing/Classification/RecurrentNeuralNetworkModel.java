@@ -54,7 +54,7 @@ public class RecurrentNeuralNetworkModel extends ComputationalGraph implements S
     // Many-to-Many RNN
     @Override
     public void train(ArrayList<Tensor> trainSet, Parameter parameters) {
-        Random random = new Random(1);
+        Random random = new Random(parameters.getSeed());
         int timeStep = -1;
         for (Tensor tensor : trainSet) {
             int size = tensor.getShape()[0];
