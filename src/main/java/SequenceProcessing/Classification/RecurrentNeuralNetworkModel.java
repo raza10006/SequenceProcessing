@@ -96,17 +96,17 @@ public class RecurrentNeuralNetworkModel extends ComputationalGraph implements S
         ArrayList<ComputationalNode> recurrentWeights = new ArrayList<>();
         int currentLength = wordEmbeddingLength + 1;
         for (int i = 0; i < ((RecurrentNeuralNetworkParameter) parameters).size(); i++) {
-            weights.add(new MultiplicationNode(true, false, new Tensor(parameters.getInitialization().initialize(currentLength, ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i), random), new int[]{currentLength, ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i)}), false));
-            recurrentWeights.add(new MultiplicationNode(true, false, new Tensor(parameters.getInitialization().initialize(((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i), ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i), random), new int[]{((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i), ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i)}), false));
+            weights.add(new MultiplicationNode(true, new Tensor(parameters.getInitialization().initialize(currentLength, ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i), random), new int[]{currentLength, ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i)})));
+            recurrentWeights.add(new MultiplicationNode(true, new Tensor(parameters.getInitialization().initialize(((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i), ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i), random), new int[]{((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i), ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i)})));
             currentLength = ((RecurrentNeuralNetworkParameter) parameters).getHiddenLayer(i) + 1;
         }
-        weights.add(new MultiplicationNode(true, false, new Tensor(parameters.getInitialization().initialize(currentLength, ((RecurrentNeuralNetworkParameter) parameters).getClassLabelSize(), random), new int[]{currentLength, ((RecurrentNeuralNetworkParameter) parameters).getClassLabelSize()}), false));
+        weights.add(new MultiplicationNode(true, new Tensor(parameters.getInitialization().initialize(currentLength, ((RecurrentNeuralNetworkParameter) parameters).getClassLabelSize(), random), new int[]{currentLength, ((RecurrentNeuralNetworkParameter) parameters).getClassLabelSize()})));
         ArrayList<ComputationalNode> currentOldLayers = new ArrayList<>();
         ArrayList<ComputationalNode> outputNodes = new ArrayList<>();
         for (int k = 0; k < timeStep; k++) {
             this.switches.add(new Switch());
             ArrayList<ComputationalNode> newOldLayers = new ArrayList<>();
-            ComputationalNode input = new MultiplicationNode(false, true, false);
+            ComputationalNode input = new MultiplicationNode(false, true);
             inputNodes.add(input);
             ComputationalNode current = input;
             for (int i = 0; i < ((RecurrentNeuralNetworkParameter) parameters).size(); i++) {

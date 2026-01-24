@@ -166,7 +166,7 @@ public class Transformer extends ComputationalGraph implements Serializable {
         int[] lnSize = new int[4];
         Random random = new Random(parameter.getSeed());
         // Encoder Block
-        ComputationalNode input1 = new MultiplicationNode(false, true, false);
+        ComputationalNode input1 = new MultiplicationNode(false, true);
         this.inputNodes.add(input1);
         ConcatenatedNode concatenatedNode1 = (ConcatenatedNode) this.concatEdges(multiHeadAttention(input1, ((TransformerParameter) parameter), false, random), 1);
         ComputationalNode we = new MultiplicationNode(true, new Tensor(parameter.getInitialization().initialize(((TransformerParameter) parameter).getL(), ((TransformerParameter) parameter).getL(), random), new int[]{((TransformerParameter) parameter).getL(), ((TransformerParameter) parameter).getL()}));
@@ -176,7 +176,7 @@ public class Transformer extends ComputationalGraph implements Serializable {
         ComputationalNode oe = this.addAdditionEdge(feedforwardNeuralNetwork(y1, ((TransformerParameter) parameter).getL(), ((TransformerParameter) parameter), random, true), y1, false);
         ComputationalNode encoder = layerNormalization(oe, ((TransformerParameter) parameter), true, lnSize);
         // Decoder Block
-        ComputationalNode input2 = new MultiplicationNode(false, true, false);
+        ComputationalNode input2 = new MultiplicationNode(false, true);
         this.inputNodes.add(input2);
         ConcatenatedNode concatenatedNode2 = (ConcatenatedNode) this.concatEdges(multiHeadAttention(input2, ((TransformerParameter) parameter), true, random), 1);
         ComputationalNode wd1 = new MultiplicationNode(true, new Tensor(parameter.getInitialization().initialize(((TransformerParameter) parameter).getL(), ((TransformerParameter) parameter).getL(), random), new int[]{((TransformerParameter) parameter).getL(), ((TransformerParameter) parameter).getL()}));
