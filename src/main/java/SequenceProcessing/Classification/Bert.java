@@ -10,10 +10,11 @@ import Math.Vector;
 import SequenceProcessing.Functions.*;
 import SequenceProcessing.Parameters.BertParameter;
 
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Random;
 
-public class Bert extends ComputationalGraph {
+public class Bert extends ComputationalGraph implements Serializable {
 
     private final VectorizedDictionary dictionary;
     private final int sepIndex;
@@ -64,11 +65,11 @@ public class Bert extends ComputationalGraph {
 
     private ArrayList<Integer> createInputTensors(Tensor instance, ComputationalNode wordInput, ComputationalNode segmentInput, int wordEmbeddingLength) {
         boolean isOutput = false;
-        int curLength = 0;
         ArrayList<Integer> classLabels = new ArrayList<>();
         ArrayList<Double> values = new ArrayList<>();
         ArrayList<Integer> segmentIds = new ArrayList<>();
         boolean afterFirstSep = false;
+        int L = wordEmbeddingLength + 1;
         for (int i = 0; i < instance.getShape()[0]; i++) {
             double val = instance.getValue(new int[]{i});
             if (val == Double.MAX_VALUE) {
@@ -79,24 +80,20 @@ public class Bert extends ComputationalGraph {
                 ArrayList<Double> segFlat = new ArrayList<>();
                 for (int r = 0; r < rows; r++) {
                     int sid = r < segmentIds.size() ? segmentIds.get(r) : 0;
-                    segFlat.add(sid == 0 ? 1.0 : 0.0);
-                    segFlat.add(sid == 0 ? 0.0 : 1.0);
+                    double segValue = (sid == 0) ? -0.05 : 0.05;
+                    for (int c = 0; c < wordEmbeddingLength; c++) {
+                        segFlat.add(segValue);
+                    }
+                    segFlat.add(0.0);
                 }
-                segmentInput.setValue(new Tensor(segFlat, new int[]{rows, 2}));
-                curLength = 0;
+                segmentInput.setValue(new Tensor(segFlat, new int[]{rows, L}));
                 values.clear();
                 segmentIds.clear();
                 afterFirstSep = false;
             } else if (isOutput) {
-                if ((curLength + 1) % (wordEmbeddingLength + 1) == 0) {
-                    classLabels.add((int) val);
-                } else {
-                    values.add(val);
-                }
-                curLength++;
+                classLabels.add((int) val);
             } else {
                 values.add(val);
-                curLength++;
                 if (values.size() % wordEmbeddingLength == 0) {
                     ArrayList<Double> row = new ArrayList<>(values.subList(values.size() - wordEmbeddingLength, values.size()));
                     int sid = afterFirstSep ? 1 : 0;
@@ -112,26 +109,26 @@ public class Bert extends ComputationalGraph {
 
     private ComputationalNode layerNormalization(ComputationalNode input, BertParameter parameter, int[] lnSize) {
         ArrayList<Double> data = new ArrayList<>();
-        ComputationalNode inputC1Mean = this.addEdge(input, new Mean());
-        ComputationalNode mean1Minus = this.addEdge(inputC1Mean, new Negation());
-        ComputationalNode inputC1Mean1Minus = this.addAdditionEdge(input, mean1Minus, false);
-        ComputationalNode variance1 = this.addEdge(inputC1Mean1Minus, new Variance());
-        ComputationalNode rootVariance1 = this.addEdge(variance1, new SquareRoot(parameter.getEpsilon()));
-        ComputationalNode inverseRootVariance1 = this.addEdge(rootVariance1, new Inverse());
-        ComputationalNode lnValue1 = this.addEdge(inputC1Mean1Minus, inverseRootVariance1, false, true);
+        ComputationalNode inputMean = this.addEdge(input, new Mean());
+        ComputationalNode meanMinus = this.addEdge(inputMean, new Negation());
+        ComputationalNode centered = this.addAdditionEdge(input, meanMinus, false);
+        ComputationalNode variance = this.addEdge(centered, new Variance());
+        ComputationalNode rootVariance = this.addEdge(variance, new SquareRoot(parameter.getEpsilon()));
+        ComputationalNode inverseRootVariance = this.addEdge(rootVariance, new Inverse());
+        ComputationalNode normalized = this.addEdge(centered, inverseRootVariance, false, true);
         for (int j = 0; j < parameter.getL(); j++) {
             data.add(parameter.getGammaValue(lnSize[0]));
         }
         lnSize[0]++;
         ComputationalNode gammaNode = new MultiplicationNode(true, false, new Tensor(data, new int[]{1, parameter.getL()}), true);
-        ComputationalNode lnValue1Gamma = this.addEdge(lnValue1, gammaNode);
-        data.clear();
+        ComputationalNode scaled = this.addEdge(normalized, gammaNode);
+        data = new ArrayList<>();
         for (int j = 0; j < parameter.getL(); j++) {
             data.add(parameter.getBetaValue(lnSize[1]));
         }
         lnSize[1]++;
         ComputationalNode betaNode = new ComputationalNode(true, false, new Tensor(data, new int[]{1, parameter.getL()}));
-        return this.addAdditionEdge(lnValue1Gamma, betaNode, false);
+        return this.addAdditionEdge(scaled, betaNode, false);
     }
 
     private ArrayList<ComputationalNode> multiHeadAttention(ComputationalNode input, BertParameter parameter, Random random) {
@@ -170,14 +167,15 @@ public class Bert extends ComputationalGraph {
         BertParameter parameter = (BertParameter) this.parameters;
         int[] lnSize = new int[]{0, 0};
         Random random = new Random(parameter.getSeed());
+        // Token + positional embeddings come in via wordInput (biased: framework appends a 1.0 column making it [r, L]).
         ComputationalNode wordInput = new MultiplicationNode(false, true);
         this.inputNodes.add(wordInput);
-        ComputationalNode segmentInput = new MultiplicationNode(false, true);
+        // Segment embeddings come in pre-shaped [r, L] (last column 0 to keep wordInput's bias intact after the addition).
+        ComputationalNode segmentInput = new ComputationalNode(false, false);
         this.inputNodes.add(segmentInput);
-        ComputationalNode wSeg = new MultiplicationNode(new Tensor(parameter.initializeWeights(2, parameter.getL() - 1, random), new int[]{2, parameter.getL() - 1}));
-        ComputationalNode segProj = this.addEdge(segmentInput, wSeg);
-        ComputationalNode embedded = this.addAdditionEdge(wordInput, segProj, false);
+        ComputationalNode embedded = this.addAdditionEdge(wordInput, segmentInput, false);
         ComputationalNode current = embedded;
+        // N stacked encoder blocks, each: bidirectional self-attention -> Add & LayerNorm -> FFN -> Add & LayerNorm.
         for (int layer = 0; layer < parameter.getNumEncoderLayers(); layer++) {
             ConcatenatedNode concatenatedNode = (ConcatenatedNode) this.concatEdges(multiHeadAttention(current, parameter, random), 1);
             ComputationalNode wo = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getL(), random), new int[]{parameter.getL(), parameter.getL()}));
@@ -188,6 +186,7 @@ public class Bert extends ComputationalGraph {
             ComputationalNode ffResidual = this.addAdditionEdge(ff, y, false);
             current = layerNormalization(ffResidual, parameter, lnSize);
         }
+        // MLM head: project the encoder output [r, L] to [r, V] and softmax over the vocabulary for each position.
         ComputationalNode wMlm = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getV(), random), new int[]{parameter.getL(), parameter.getV()}));
         ComputationalNode mlmLogits = this.addEdge(current, wMlm);
         this.outputNode = this.addEdge(mlmLogits, new Softmax());
@@ -222,7 +221,6 @@ public class Bert extends ComputationalGraph {
         BertParameter parameter = (BertParameter) this.parameters;
         for (Tensor instance : testSet) {
             ArrayList<Integer> goldClassLabels = createInputTensors(instance, this.inputNodes.get(0), this.inputNodes.get(1), parameter.getL() - 1);
-            this.forwardCalculation();
             ArrayList<Double> predictions = this.predict();
             int n = Math.min(goldClassLabels.size(), predictions.size());
             for (int i = 0; i < n; i++) {
