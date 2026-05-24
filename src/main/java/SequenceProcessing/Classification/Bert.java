@@ -150,6 +150,61 @@ public class Bert extends ComputationalGraph implements Serializable {
         return nodes;
     }
 
+    /**
+     * Builds the standard BERT Next Sentence Prediction (NSP) sub-graph.
+     *
+     * NSP is the second of BERT's two pre-training objectives (the first being Masked
+     * Language Modeling, MLM). Given a packed pair of sentences {@code [CLS] A [SEP] B [SEP]},
+     * NSP asks the model to decide whether sentence B is the actual sentence that follows
+     * sentence A in the source corpus, or a random sentence drawn from elsewhere. It is a
+     * simple binary classification task whose only purpose during pre-training is to push
+     * the encoder towards producing a pooled sentence-pair representation in the {@code [CLS]}
+     * position that captures inter-sentence coherence.
+     *
+     * The standard recipe, mirrored here, is:
+     * <ol>
+     *   <li>Take the final encoder output at row 0 (the {@code [CLS]} token),
+     *       a single biased row of shape {@code [1, L]}.</li>
+     *   <li><b>Pooler</b>: a learnable linear projection of shape {@code [L, L]} followed by
+     *       a {@link Tanh} activation. Following the {@code addEdge(node, function, true)}
+     *       convention used elsewhere in this file, the activation appends a bias column,
+     *       so the pooled representation has shape {@code [1, L + 1]}.</li>
+     *   <li><b>2-class projection</b>: a learnable linear projection of shape
+     *       {@code [L + 1, 2]} producing logits of shape {@code [1, 2]} (isNext / notNext).</li>
+     *   <li><b>Softmax</b>: applied over the two-class axis to yield NSP probabilities.</li>
+     * </ol>
+     *
+     * <b>Why this method is defined but never wired into the live graph:</b> the
+     * {@link ComputationalGraph} base class exposes a single {@code outputNode} and a single
+     * loss target per graph. The MLM head built in {@link #train(ArrayList)} already occupies
+     * that output with a per-token {@code [r, V]} distribution. Adding NSP as a second live
+     * head would mean either overwriting {@code outputNode} (silently disabling MLM) or
+     * attempting to backpropagate through two output heads under one loss, both of which
+     * break the framework's contract. Real BERT pre-training combines MLM and NSP losses,
+     * but with the current single-head computational graph that is not expressible in one
+     * pass, so MLM remains the active head and this method is provided as a documented,
+     * self-contained construction of the NSP sub-graph (e.g. for future multi-head support
+     * or for callers that want to wire NSP as the sole objective in a separate {@code Bert}
+     * instance). It is intentionally not invoked from {@link #train(ArrayList)}.
+     *
+     * @param clsRepresentation the {@code [CLS]} row of the final encoder output, expected
+     *                          to be a biased {@code [1, L]} node produced by the caller.
+     * @param parameter         the BERT parameter bundle, used for {@code L} and weight
+     *                          initialization.
+     * @param random            the seeded RNG used for weight initialization, shared with
+     *                          the rest of the graph for reproducibility.
+     * @return the NSP softmax node of shape {@code [1, 2]}; the caller is responsible for
+     *         deciding whether to attach it as a loss target.
+     */
+    private ComputationalNode nextSentencePrediction(ComputationalNode clsRepresentation, BertParameter parameter, Random random) {
+        ComputationalNode poolerWeight = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getL(), random), new int[]{parameter.getL(), parameter.getL()}));
+        ComputationalNode pooled = this.addEdge(clsRepresentation, poolerWeight);
+        ComputationalNode pooledTanh = this.addEdge(pooled, new Tanh(), true);
+        ComputationalNode projectionWeight = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL() + 1, 2, random), new int[]{parameter.getL() + 1, 2}));
+        ComputationalNode logits = this.addEdge(pooledTanh, projectionWeight);
+        return this.addEdge(logits, new Softmax());
+    }
+
     private ComputationalNode feedForwardNetwork(ComputationalNode current, int currentLayerSize, BertParameter parameter, Random random) {
         int size = parameter.getFeedForwardSize();
         for (int i = 0; i < size; i++) {
@@ -241,7 +296,7 @@ public class Bert extends ComputationalGraph implements Serializable {
         ArrayList<Double> classLabels = new ArrayList<>();
         Tensor value = outputNode.getValue();
         for (int i = 0; i < value.getShape()[0]; i++) {
-            double max = Double.MIN_VALUE;
+            double max = -Double.MAX_VALUE;
             double index = -1;
             for (int j = 0; j < value.getShape()[1]; j++) {
                 if (value.getValue(new int[]{i, j}) > max) {

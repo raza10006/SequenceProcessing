@@ -270,3 +270,33 @@ public class AnnotatedSentenceTest {
     public void setUp() throws Exception {
         sentence0 = new AnnotatedSentence(new File("sentences/0000.dev"));
 ```
+
+BERT
+============
+
+BERT (Bidirectional Encoder Representations from Transformers) is an encoder-only language model that, unlike the encoder–decoder `Transformer` in `SequenceProcessing/Classification/Transformer.java`, drops the autoregressive decoder entirely. Every token in the input is allowed to attend to every other token in both directions at every layer (no causal mask), which makes the resulting representations contextual on both the left and the right. Pre-training is done with two self-supervised objectives: Masked Language Modeling (MLM), where a random subset of input tokens is replaced with `[MASK]` and the model has to predict the original vocabulary id at those positions, and Next Sentence Prediction (NSP), where two sentences are packed as `[CLS] A [SEP] B [SEP]` and the model decides from the pooled `[CLS]` representation whether B is the actual successor of A.
+
+## Architecture mapping to the code
+
+The implementation lives in `src/main/java/SequenceProcessing/Classification/Bert.java`, with hyperparameters in `src/main/java/SequenceProcessing/Parameters/BertParameter.java`. The encoder graph is built end-to-end in `Bert#train`:
+
+* **Input** — token, segment, and positional embeddings are summed before the first encoder block. The token embeddings come in through `wordInput` (a `MultiplicationNode` with the framework's `isBiased=true`, so a `1.0` bias column is appended automatically, giving an `[r, L]` shape). `Bert#positionalEncoding` adds the standard sinusoidal position encoding directly to the token tensor before it is set on `wordInput`. Segment embeddings come in through `segmentInput`, pre-shaped to `[r, L]` with the last column held at `0.0` so the addition into `wordInput` does not disturb the existing bias column. Segment ids are auto-detected by `Bert#matchesSepRow`, which compares each row to the `[SEP]` vector in the supplied `VectorizedDictionary`.
+* **N stacked encoder blocks** — each block runs `multiHeadAttention` (N parallel heads computing `softmax(QKᵀ / √dk) · V`, concatenated along axis 1, then projected by an `[L, L]` output weight), followed by **Add & LayerNorm**, then `feedForwardNetwork` (a configurable stack of hidden layers with per-layer activation functions and a final `[currentSize, L]` projection), followed by another **Add & LayerNorm**. `numEncoderLayers` controls how many such blocks are stacked.
+* **MLM head** — the encoder output `[r, L]` is projected to `[r, V]` by a learnable `[L, V]` matrix and passed through `Softmax` over the vocabulary axis. This is the head wired into the graph's `outputNode`, and it is the head trained by `forwardCalculation` / `backpropagation` against per-token gold ids.
+* **NSP head** — provided as the documented method `Bert#nextSentencePrediction(clsRepresentation, parameter, random)`. It implements the canonical pooler → 2-class projection → Softmax recipe: a learnable `[L, L]` pooler followed by `Tanh`, then a learnable `[L+1, 2]` projection to `isNext` / `notNext` logits, then `Softmax`. The method is intentionally not invoked from `train` (see "Key design decisions" below).
+
+## Key design decisions
+
+* **No attention masking — fully bidirectional.** Unlike the decoder side of `Transformer.java`, which calls `multiHeadAttention(..., isMasked=true)` and inserts a `Mask` node before the softmax, every encoder block in `Bert.java` uses unmasked attention so each position can see the full sequence on both sides.
+* **Segment embedding shape `[r, L]` with a zero bias column.** The framework appends a `1.0` bias column to `wordInput`, so the segment input has to be the same width or the `addAdditionEdge` would not line up. `Bert#createInputTensors` builds the segment tensor with `−0.05` (segment 0) or `+0.05` (segment 1) in the first `L − 1` columns and `0.0` in the trailing bias column, so summing `wordInput + segmentInput` leaves the bias column intact for the rest of the graph.
+* **Manual LayerNorm with `γ` / `β` pulled per layer.** `Bert#layerNormalization` builds the LN sub-graph (`mean → centered → variance → 1/√(var+ε) → multiply → add`) directly out of `ComputationalGraph` primitives. The `γ` and `β` rows are sourced from `BertParameter` via the `lnSize` counter, so each LN call site consumes its own pair from the supplied arrays. This is intentional: it mirrors the LayerNorm style already used in `Transformer.java` and keeps `BertParameter`'s constructor signature stable.
+* **Single-`outputNode` constraint — MLM is the active head, NSP is documented.** The `ComputationalGraph` base class exposes a single `outputNode` and a single loss target per graph. The MLM head already occupies that output with a per-token `[r, V]` distribution, so wiring NSP as a second live head would either silently overwrite `outputNode` or violate the framework's one-head/one-loss contract. NSP is therefore provided as a self-contained method (with full Javadoc) that builds the standard pooler → projection → softmax sub-graph from a `[CLS]` representation but is not called from `train`. MLM stays the active objective.
+
+## Running the BERT tests
+
+The unit tests for the BERT implementation live in `src/test/java/BertTest.java`. They cover (1) end-to-end construction, training and `test()` accuracy reporting on a tiny synthetic dataset with an empty dictionary, and (2) the segment-detection path with a populated dictionary that contains a real `[SEP]` entry so `Bert#matchesSepRow` actually fires and the second segment receives the `+0.05` segment embedding.
+
+From the project root:
+
+    mvn test -Dtest=BertTest
+

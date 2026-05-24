@@ -1,21 +1,34 @@
-import ComputationalGraph.*;
+import Classification.Performance.ClassificationPerformance;
 import ComputationalGraph.Function.Sigmoid;
 import ComputationalGraph.Function.Tanh;
 import ComputationalGraph.Initialization.RandomInitialization;
 import ComputationalGraph.Loss.CrossEntropyLoss;
 import ComputationalGraph.Optimizer.AdamW;
 import Dictionary.VectorizedDictionary;
+import Dictionary.VectorizedWord;
 import Dictionary.Word;
 import Dictionary.WordComparator;
+import Math.Tensor;
+import Math.Vector;
 import SequenceProcessing.Classification.Bert;
 import SequenceProcessing.Parameters.BertParameter;
 import org.junit.Test;
-import Math.Tensor;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 
+import static org.junit.Assert.*;
+
 public class BertTest {
+
+    private static VectorizedDictionary emptyDictionary() {
+        return new VectorizedDictionary(new WordComparator() {
+            @Override
+            public int compare(Word word, Word word1) {
+                return 0;
+            }
+        });
+    }
 
     @Test
     public void testInitialization() {
@@ -56,7 +69,7 @@ public class BertTest {
             gammaValues.add(1.0);
             betaValues.add(0.0);
         }
-        ComputationalGraph bert = new Bert(
+        Bert bert = new Bert(
                 new BertParameter(
                         1,
                         1,
@@ -72,12 +85,77 @@ public class BertTest {
                         activationFunctions,
                         gammaValues,
                         betaValues),
-                new VectorizedDictionary(new WordComparator() {
-                    @Override
-                    public int compare(Word word, Word word1) {
-                        return 0;
-                    }
-                }));
+                emptyDictionary());
         bert.train(tensors);
+        ClassificationPerformance performance = bert.test(tensors);
+        assertNotNull(performance);
+        double accuracy = performance.getAccuracy();
+        assertTrue("accuracy should be in [0.0, 1.0] but was " + accuracy, accuracy >= 0.0 && accuracy <= 1.0);
+    }
+
+    @Test
+    public void testSegmentDetection() {
+        // Populate the dictionary with a real [SEP] entry (and a couple of dummy words) so the
+        // segment-detection path in Bert#createInputTensors actually fires when a token row
+        // matches the [SEP] vector. This is the case the empty-dictionary test never exercises.
+        VectorizedDictionary dictionary = new VectorizedDictionary(new WordComparator() {
+            @Override
+            public int compare(Word word, Word word1) {
+                return 0;
+            }
+        });
+        dictionary.addWord(new VectorizedWord("hello", new Vector(new double[]{0.2, 0.7, 0.1})));
+        dictionary.addWord(new VectorizedWord("world", new Vector(new double[]{0.3, 0.4, 0.8})));
+        dictionary.addWord(new VectorizedWord("[SEP]", new Vector(new double[]{0.5, 0.5, 0.5})));
+
+        // Five token rows × 3 features = 15 doubles, then the Double.MAX_VALUE sentinel,
+        // then 5 gold MLM labels (one per row). Row index 2 is the [SEP] row, which matches
+        // the dictionary [SEP] vector exactly and flips afterFirstSep so the trailing rows
+        // are assigned segment id 1.
+        ArrayList<Tensor> tensors = new ArrayList<>();
+        tensors.add(new Tensor(Arrays.asList(
+                0.2, 0.7, 0.1,
+                0.3, 0.4, 0.8,
+                0.5, 0.5, 0.5,
+                0.9, 0.35, 0.12,
+                0.27, 0.17, 0.41,
+                Double.MAX_VALUE,
+                1.0, 2.0, 3.0, 4.0, 5.0
+        ), new int[]{21}));
+
+        ArrayList<Integer> feedForwardHiddenLayers = new ArrayList<>();
+        feedForwardHiddenLayers.add(8);
+        feedForwardHiddenLayers.add(4);
+        ArrayList<Object> activationFunctions = new ArrayList<>();
+        activationFunctions.add(new Tanh());
+        activationFunctions.add(new Sigmoid());
+        ArrayList<Double> gammaValues = new ArrayList<>();
+        ArrayList<Double> betaValues = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            gammaValues.add(1.0);
+            betaValues.add(0.0);
+        }
+        Bert bert = new Bert(
+                new BertParameter(
+                        1,
+                        1,
+                        new AdamW(0.025, 0.99, 0.99, 0.999, 1e-10, 0.1),
+                        new RandomInitialization(),
+                        new CrossEntropyLoss(),
+                        3,
+                        2,
+                        7,
+                        2,
+                        1e-9,
+                        feedForwardHiddenLayers,
+                        activationFunctions,
+                        gammaValues,
+                        betaValues),
+                dictionary);
+        bert.train(tensors);
+        ClassificationPerformance performance = bert.test(tensors);
+        assertNotNull(performance);
+        double accuracy = performance.getAccuracy();
+        assertTrue("accuracy should be in [0.0, 1.0] but was " + accuracy, accuracy >= 0.0 && accuracy <= 1.0);
     }
 }
