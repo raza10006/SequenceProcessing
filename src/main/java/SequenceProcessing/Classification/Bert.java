@@ -12,6 +12,7 @@ import SequenceProcessing.Parameters.BertParameter;
 
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Random;
 
 public class Bert extends ComputationalGraph implements Serializable {
@@ -151,6 +152,68 @@ public class Bert extends ComputationalGraph implements Serializable {
     }
 
     /**
+     * Selects the token positions that participate in the Masked Language Modeling
+     * (MLM) loss for a single training instance.
+     *
+     * Real BERT pre-training picks roughly 15% of the input token positions uniformly
+     * at random and only those positions contribute to the MLM cross-entropy loss; the
+     * remaining 85% of positions are ignored by the loss. The original paper further
+     * perturbs the input embeddings at the selected positions with the canonical
+     * 80/10/10 split: 80% of the chosen positions are replaced with the {@code [MASK]}
+     * token vector, 10% are replaced with a random vocabulary item, and 10% are kept
+     * unchanged. This helper implements the position-selection step (which positions
+     * get masked); the 80/10/10 input-perturbation step is left as a documented
+     * simplification because applying it cleanly would require a populated
+     * {@code [MASK]} entry in the {@link VectorizedDictionary} (the existing tests use
+     * either an empty dictionary or one without {@code [MASK]}) plus invasive changes
+     * to {@link #createInputTensors(Tensor, ComputationalNode, ComputationalNode, int)}
+     * to substitute embedding rows on a per-position basis. Position-level masking on
+     * the loss path is the part that materially changes the training objective and is
+     * what the architecture diagram explicitly calls out.
+     *
+     * The number of selected positions is {@code ceil(0.15 * sequenceLength)} with a
+     * floor of 1 for any non-empty sequence, so that the very short sequences used by
+     * the unit tests (e.g. four token rows) still produce a non-trivial training
+     * signal each step rather than being silently skipped by integer truncation.
+     * Selection happens via the caller-supplied {@link Random} — {@code train} passes
+     * in the same {@code parameter.getSeed()}-seeded RNG used for weight initialization
+     * and shuffling — so masked-position selection is fully deterministic and
+     * reproducible across runs.
+     *
+     * Within the framework's single-{@code outputNode}/single-loss contract, the
+     * selected positions are mapped onto the loss path by setting the gold one-hot
+     * row for each selected position and zeroing out the gold row for every
+     * non-selected position. Cross-entropy on an all-zero target row is exactly
+     * {@code -sum(0 * log p) = 0}, so non-masked positions contribute neither value
+     * nor gradient, faithfully reproducing "compute the loss only on masked
+     * positions" without requiring a second loss target or graph head.
+     *
+     * @param sequenceLength the number of token rows in the current input instance.
+     * @param random         the seeded RNG used to draw positions; sharing the
+     *                       class's training RNG keeps masking reproducible.
+     * @return a sorted, distinct list of position indices in {@code [0, sequenceLength)}
+     *         selected for masking; the empty list when {@code sequenceLength <= 0}.
+     */
+    private static ArrayList<Integer> selectMaskedPositions(int sequenceLength, Random random) {
+        ArrayList<Integer> selected = new ArrayList<>();
+        if (sequenceLength <= 0) {
+            return selected;
+        }
+        int target = Math.min(sequenceLength, Math.max(1, (int) Math.ceil(0.15 * sequenceLength)));
+        ArrayList<Integer> pool = new ArrayList<>();
+        for (int i = 0; i < sequenceLength; i++) {
+            pool.add(i);
+        }
+        // Uniform sampling without replacement: pull from a shrinking pool of unselected indices.
+        for (int k = 0; k < target; k++) {
+            int idx = random.nextInt(pool.size());
+            selected.add(pool.remove(idx));
+        }
+        selected.sort(null);
+        return selected;
+    }
+
+    /**
      * Builds the standard BERT Next Sentence Prediction (NSP) sub-graph.
      *
      * NSP is the second of BERT's two pre-training objectives (the first being Masked
@@ -251,10 +314,21 @@ public class Bert extends ComputationalGraph implements Serializable {
             this.shuffle(trainSet, random);
             for (Tensor instance : trainSet) {
                 ArrayList<Integer> classLabels = createInputTensors(instance, this.inputNodes.get(0), this.inputNodes.get(1), parameter.getL() - 1);
+                // MLM masking: pick ~15% of token positions to mask and only those positions
+                // contribute to the loss. We realize this within the framework's single-loss
+                // contract by setting the one-hot gold for masked rows and leaving non-masked
+                // rows as all zeros, which makes their cross-entropy contribution exactly 0
+                // (and therefore their gradient contribution 0 as well). See selectMaskedPositions
+                // for the 15% / floor-of-1 convention and for the noted simplification of the
+                // canonical 80/10/10 input-perturbation split.
+                ArrayList<Integer> maskedPositions = selectMaskedPositions(classLabels.size(), random);
+                HashSet<Integer> maskedSet = new HashSet<>(maskedPositions);
                 ArrayList<Double> classLabelValues = new ArrayList<>();
-                for (Integer classLabel : classLabels) {
+                for (int row = 0; row < classLabels.size(); row++) {
+                    boolean masked = maskedSet.contains(row);
+                    int classLabel = classLabels.get(row);
                     for (int j = 0; j < parameter.getV(); j++) {
-                        if (j == classLabel) {
+                        if (masked && j == classLabel) {
                             classLabelValues.add(1.0);
                         } else {
                             classLabelValues.add(0.0);
