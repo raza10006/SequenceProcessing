@@ -20,6 +20,12 @@ public class Bert extends ComputationalGraph implements Serializable {
     private final VectorizedDictionary dictionary;
     private final int sepIndex;
 
+    /**
+     * Constructs a BERT model from the given parameter bundle and vectorized dictionary,
+     * caching the dictionary index of the {@code [SEP]} token for later segment detection.
+     * @param parameter The hyperparameter container; expected to be a {@link BertParameter}.
+     * @param dictionary The vectorized dictionary used to look up the {@code [SEP]} entry.
+     */
     public Bert(NeuralNetworkParameter parameter, VectorizedDictionary dictionary) {
         super(parameter);
         this.dictionary = dictionary;
@@ -33,6 +39,14 @@ public class Bert extends ComputationalGraph implements Serializable {
         this.sepIndex = sep;
     }
 
+    /**
+     * Adds the standard sinusoidal positional encoding to a token embedding tensor.
+     * Even feature columns receive a sine offset and odd columns a cosine offset, both
+     * scaled by the canonical {@code 10000^(2i/d)} frequency.
+     * @param tensor The token embedding tensor of shape {@code [r, wordEmbeddingLength]}.
+     * @param wordEmbeddingLength The width of the embedding dimension.
+     * @return A new tensor of the same shape with the positional encoding added in-place.
+     */
     private Tensor positionalEncoding(Tensor tensor, int wordEmbeddingLength) {
         ArrayList<Double> values = new ArrayList<>();
         for (int i = 0; i < tensor.getShape()[0]; i++) {
@@ -48,6 +62,15 @@ public class Bert extends ComputationalGraph implements Serializable {
         return new Tensor(values, tensor.getShape());
     }
 
+    /**
+     * Checks whether the given embedding row matches the cached {@code [SEP]} vector,
+     * used by {@link #createInputTensors} to auto-detect sentence boundaries when
+     * assigning segment ids. Returns {@code false} when no {@code [SEP]} entry was
+     * found in the dictionary or when the row length does not match.
+     * @param row The candidate embedding row to test.
+     * @return {@code true} when the row matches the {@code [SEP]} vector within a small
+     *         numerical tolerance, {@code false} otherwise.
+     */
     private boolean matchesSepRow(ArrayList<Double> row) {
         if (sepIndex < 0) {
             return false;
@@ -64,6 +87,18 @@ public class Bert extends ComputationalGraph implements Serializable {
         return true;
     }
 
+    /**
+     * Parses a packed training instance into the BERT word and segment input tensors and
+     * returns the gold token ids that follow the {@link Double#MAX_VALUE} sentinel. Token
+     * embeddings populate {@code wordInput} (with positional encoding applied), while
+     * {@code segmentInput} receives the segment-id tensor whose ids flip at the first
+     * {@code [SEP]} row and whose trailing bias column is held at {@code 0.0}.
+     * @param instance The packed input tensor: embedding rows, {@code Double.MAX_VALUE}, then class labels.
+     * @param wordInput The graph input node that receives the token embedding tensor.
+     * @param segmentInput The graph input node that receives the segment embedding tensor.
+     * @param wordEmbeddingLength The width of a single token embedding row.
+     * @return The list of gold class labels (one per token row) read from the instance.
+     */
     private ArrayList<Integer> createInputTensors(Tensor instance, ComputationalNode wordInput, ComputationalNode segmentInput, int wordEmbeddingLength) {
         boolean isOutput = false;
         ArrayList<Integer> classLabels = new ArrayList<>();
@@ -108,6 +143,17 @@ public class Bert extends ComputationalGraph implements Serializable {
         return classLabels;
     }
 
+    /**
+     * Builds the LayerNorm sub-graph on top of the given input node: subtracts the row
+     * mean, divides by the square root of the row variance plus {@code epsilon}, then
+     * applies a learnable {@code gamma} scale and {@code beta} shift. The {@code gamma}
+     * and {@code beta} rows are pulled from {@link BertParameter} via the {@code lnSize}
+     * counters so each LayerNorm call site consumes its own pair.
+     * @param input The input node to normalize.
+     * @param parameter The BERT parameter bundle supplying {@code epsilon}, {@code L}, gamma and beta.
+     * @param lnSize Two-element counter array tracking how many gamma and beta rows have been consumed.
+     * @return The output node of the LayerNorm sub-graph.
+     */
     private ComputationalNode layerNormalization(ComputationalNode input, BertParameter parameter, int[] lnSize) {
         ArrayList<Double> data = new ArrayList<>();
         ComputationalNode inputMean = this.addEdge(input, new Mean());
@@ -132,6 +178,16 @@ public class Bert extends ComputationalGraph implements Serializable {
         return this.addAdditionEdge(scaled, betaNode, false);
     }
 
+    /**
+     * Builds the {@code N} parallel self-attention heads for one encoder block. Each
+     * head learns its own {@code Wk}, {@code Wq}, {@code Wv} of shape {@code [L, dk]}
+     * and computes {@code softmax(QKᵀ / sqrt(dk)) · V}. The attention is unmasked, so
+     * every position attends bidirectionally to every other position.
+     * @param input The shared input node fed to all heads.
+     * @param parameter The BERT parameter bundle supplying {@code N}, {@code L} and {@code dk}.
+     * @param random The seeded RNG used to initialize the per-head weights.
+     * @return The list of {@code N} attention head output nodes, ready to be concatenated.
+     */
     private ArrayList<ComputationalNode> multiHeadAttention(ComputationalNode input, BertParameter parameter, Random random) {
         ArrayList<ComputationalNode> nodes = new ArrayList<>();
         for (int i = 0; i < parameter.getN(); i++) {
@@ -268,6 +324,17 @@ public class Bert extends ComputationalGraph implements Serializable {
         return this.addEdge(logits, new Softmax());
     }
 
+    /**
+     * Builds the position-wise feed-forward sub-graph used inside each encoder block:
+     * a configurable stack of hidden linear-then-activation layers followed by a final
+     * linear projection back to {@code L}. Hidden sizes and per-layer activation
+     * functions are taken from {@link BertParameter}.
+     * @param current The input node entering the feed-forward sub-graph.
+     * @param currentLayerSize The width of {@code current}, including the bias column.
+     * @param parameter The BERT parameter bundle supplying the hidden-layer spec and {@code L}.
+     * @param random The seeded RNG used to initialize the hidden-layer weights.
+     * @return The output node of the feed-forward sub-graph, of width {@code L}.
+     */
     private ComputationalNode feedForwardNetwork(ComputationalNode current, int currentLayerSize, BertParameter parameter, Random random) {
         int size = parameter.getFeedForwardSize();
         for (int i = 0; i < size; i++) {
@@ -280,6 +347,16 @@ public class Bert extends ComputationalGraph implements Serializable {
         return this.addEdge(current, outputWeight);
     }
 
+    /**
+     * Builds the full BERT encoder graph (token + segment + positional input,
+     * {@code numEncoderLayers} stacked bidirectional self-attention blocks each with
+     * Add &amp; LayerNorm, FFN, and another Add &amp; LayerNorm, then the MLM head) and
+     * trains it for {@code parameter.getEpoch()} epochs. For each instance ~15% of the
+     * token positions are picked by {@link #selectMaskedPositions} and only those rows
+     * receive a one-hot gold target, so the MLM cross-entropy loss is computed solely
+     * at masked positions.
+     * @param trainSet The list of packed training tensors; each is shuffled and consumed once per epoch.
+     */
     @Override
     public void train(ArrayList<Tensor> trainSet) {
         BertParameter parameter = (BertParameter) this.parameters;
@@ -343,6 +420,13 @@ public class Bert extends ComputationalGraph implements Serializable {
         }
     }
 
+    /**
+     * Evaluates the trained model on a held-out set of packed tensors, comparing the
+     * per-token argmax predictions against the gold labels embedded in each instance
+     * and returning the resulting classification accuracy.
+     * @param testSet The list of packed test tensors in the same layout as the training set.
+     * @return The classification performance whose accuracy is in {@code [0.0, 1.0]}.
+     */
     @Override
     public ClassificationPerformance test(ArrayList<Tensor> testSet) {
         int count = 0;
@@ -365,6 +449,11 @@ public class Bert extends ComputationalGraph implements Serializable {
         return new ClassificationPerformance((count + 0.00) / Math.max(total, 1));
     }
 
+    /**
+     * Reads the current value of the output node and returns the per-row argmax over the
+     * vocabulary axis, i.e. the predicted token id for each position in the sequence.
+     * @return A list of predicted class indices, one per row of the output tensor.
+     */
     @Override
     protected ArrayList<Double> getOutputValue() {
         ArrayList<Double> classLabels = new ArrayList<>();
