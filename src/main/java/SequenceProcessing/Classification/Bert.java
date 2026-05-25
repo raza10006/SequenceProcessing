@@ -45,7 +45,7 @@ public class Bert extends ComputationalGraph implements Serializable {
      * scaled by the canonical {@code 10000^(2i/d)} frequency.
      * @param tensor The token embedding tensor of shape {@code [r, wordEmbeddingLength]}.
      * @param wordEmbeddingLength The width of the embedding dimension.
-     * @return A new tensor of the same shape with the positional encoding added in-place.
+     * @return A new tensor of the same shape with the positional encoding added pointwise.
      */
     private Tensor positionalEncoding(Tensor tensor, int wordEmbeddingLength) {
         ArrayList<Double> values = new ArrayList<>();
