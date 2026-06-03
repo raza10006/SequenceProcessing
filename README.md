@@ -295,7 +295,14 @@ The implementation lives in `src/main/java/SequenceProcessing/Classification/Ber
 
 ## Running the BERT tests
 
-The unit tests for the BERT implementation live in `src/test/java/BertTest.java`. They cover (1) end-to-end construction, training and `test()` accuracy reporting on a tiny synthetic dataset with an empty dictionary, (2) the segment-detection path with a populated dictionary that contains a real `[SEP]` entry so `Bert#matchesSepRow` actually fires and the second segment receives the `+0.05` segment embedding, and (3) `testMaskedPositionSelection`, which reflects into the private `Bert#selectMaskedPositions` helper and asserts the masking-policy invariants the architecture relies on: the count rule (`ceil(0.15 × n)` for long sequences, exactly 1 for the short-sequence floor), every returned index is in range `[0, sequenceLength)`, the result is distinct and sorted, the empty-sequence edge case returns an empty list, and a fresh `Random` seeded with the same value reproduces the same masked positions exactly (so training-time masking is deterministic).
+The unit tests for the BERT implementation live in `src/test/java/BertTest.java`, six in total:
+
+* **`testInitialization`** — end-to-end construction, training, and `test()` accuracy reporting on a tiny synthetic dataset with an empty dictionary.
+* **`testSegmentDetection`** — the segment-detection path with a populated dictionary that contains a real `[SEP]` entry, so `Bert#matchesSepRow` actually fires and the second segment receives the `+0.05` segment embedding.
+* **`testMaskedPositionSelection`** — reflects into the private `Bert#selectMaskedPositions` helper and asserts the masking-policy invariants the architecture relies on: the count rule (`ceil(0.15 × n)` for long sequences, exactly 1 for the short-sequence floor), every returned index is in range `[0, sequenceLength)`, the result is distinct and sorted, the empty-sequence edge case returns an empty list, and a fresh `Random` seeded with the same value reproduces the same masked positions exactly (so training-time masking is deterministic).
+* **`testMaskedPositionsCountForVariousSequenceLengths`** — sweeps a range of sequence lengths (`1, 7, 13, 20, 50, 200`) and asserts the count rule `max(1, ceil(0.15 × n))` holds for each, nailing down both the 15% rule and the floor-of-1 rule across many sizes rather than just the two cases pinned by `testMaskedPositionSelection`.
+* **`testMaskedPositionsAreAlwaysSubsetOfSequence`** — stress-tests the safety invariants across multiple lengths and seeds, asserting every returned index is in range `[0, n)` and the selection contains no duplicates.
+* **`testTrainTestPipelineIsDeterministicForFixedSeed`** — builds two independent `Bert` instances with identical `BertParameter` (seed `1`) and identical synthetic tensors, trains and tests each, then asserts the resulting accuracies are equal within `1e-9`, verifying that the full training/testing pipeline is reproducible under the seeded RNG.
 
 From the project root:
 
