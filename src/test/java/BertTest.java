@@ -205,4 +205,120 @@ public class BertTest {
         ArrayList<Integer> hundredAgain = invokeSelectMaskedPositions(100, new Random(42));
         assertEquals("same seed must produce the same masked positions", hundred, hundredAgain);
     }
+
+    @Test
+    public void testMaskedPositionsCountForVariousSequenceLengths() throws Exception {
+        // The masking helper must satisfy size == max(1, ceil(0.15 * n)) across a spread of
+        // lengths, not just the 100 / 4 cases pinned by testMaskedPositionSelection. This nails
+        // down both the 15% rule (for larger n) and the floor-of-1 rule (for tiny n).
+        int[] lengths = {1, 7, 13, 20, 50, 200};
+        for (int n : lengths) {
+            ArrayList<Integer> selected = invokeSelectMaskedPositions(n, new Random(1));
+            int expected = Math.max(1, (int) Math.ceil(0.15 * n));
+            assertEquals("expected max(1, ceil(0.15 * " + n + ")) masked positions", expected, selected.size());
+        }
+    }
+
+    @Test
+    public void testMaskedPositionsAreAlwaysSubsetOfSequence() throws Exception {
+        // Stress-test the safety invariants across several lengths and seeds: every returned
+        // index must be a valid in-range position and the selection must be duplicate-free.
+        int[] lengths = {1, 5, 13, 37, 100};
+        long[] seeds = {1L, 7L, 42L, 123L};
+        for (int n : lengths) {
+            for (long seed : seeds) {
+                ArrayList<Integer> selected = invokeSelectMaskedPositions(n, new Random(seed));
+                for (int position : selected) {
+                    assertTrue("position " + position + " out of range for length " + n,
+                            position >= 0 && position < n);
+                }
+                HashSet<Integer> distinct = new HashSet<>(selected);
+                assertEquals("masked positions must contain no duplicates (n=" + n + ", seed=" + seed + ")",
+                        selected.size(), distinct.size());
+            }
+        }
+    }
+
+    @Test
+    public void testTrainTestPipelineIsDeterministicForFixedSeed() {
+        // The seeded RNG (seed=1) drives weight initialization, shuffling, and mask selection, so
+        // two independently constructed models trained and tested on identical data must report
+        // the exact same accuracy. Each model gets its own fresh tensors and parameter bundle so
+        // neither in-place shuffling nor optimizer state can leak between the two runs.
+        Bert first = buildInitializationBert();
+        first.train(buildInitializationTensors());
+        double firstAccuracy = first.test(buildInitializationTensors()).getAccuracy();
+
+        Bert second = buildInitializationBert();
+        second.train(buildInitializationTensors());
+        double secondAccuracy = second.test(buildInitializationTensors()).getAccuracy();
+
+        assertEquals("fixed seed must make the train/test pipeline reproducible",
+                firstAccuracy, secondAccuracy, 1e-9);
+    }
+
+    private static ArrayList<Tensor> buildInitializationTensors() {
+        // Same tensor structure as testInitialization, rebuilt fresh on each call so the two
+        // deterministic-pipeline runs never share (and never mutate) the same instance.
+        ArrayList<Tensor> tensors = new ArrayList<>();
+        tensors.add(new Tensor(Arrays.asList(
+                0.2, 0.7, 0.1,
+                0.3, 0.4, 0.8,
+                0.9, 0.35, 0.12,
+                0.27, 0.17, 0.41,
+                Double.MAX_VALUE,
+                1.0, 6.0, 5.0, 4.0
+        ), new int[]{17}));
+        tensors.add(new Tensor(Arrays.asList(
+                0.2, 0.7, 0.1,
+                0.3, 0.4, 0.8,
+                0.9, 0.35, 0.12,
+                0.27, 0.17, 0.41,
+                Double.MAX_VALUE,
+                1.0, 6.0, 5.0, 2.0
+        ), new int[]{17}));
+        tensors.add(new Tensor(Arrays.asList(
+                0.2, 0.7, 0.1,
+                1.2, 3.6, 7.1,
+                5.4, 0.17, 9.8,
+                0.77, 0.61, 0.27,
+                Double.MAX_VALUE,
+                3.0, 4.0, 2.0, 0.0
+        ), new int[]{17}));
+        return tensors;
+    }
+
+    private static Bert buildInitializationBert() {
+        // Same hyperparameters as testInitialization, rebuilt fresh on each call so each model
+        // owns an independent BertParameter (and optimizer state).
+        ArrayList<Integer> feedForwardHiddenLayers = new ArrayList<>();
+        feedForwardHiddenLayers.add(8);
+        feedForwardHiddenLayers.add(4);
+        ArrayList<Object> activationFunctions = new ArrayList<>();
+        activationFunctions.add(new Tanh());
+        activationFunctions.add(new Sigmoid());
+        ArrayList<Double> gammaValues = new ArrayList<>();
+        ArrayList<Double> betaValues = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            gammaValues.add(1.0);
+            betaValues.add(0.0);
+        }
+        return new Bert(
+                new BertParameter(
+                        1,
+                        1,
+                        new AdamW(0.025, 0.99, 0.99, 0.999, 1e-10, 0.1),
+                        new RandomInitialization(),
+                        new CrossEntropyLoss(),
+                        3,
+                        2,
+                        7,
+                        2,
+                        1e-9,
+                        feedForwardHiddenLayers,
+                        activationFunctions,
+                        gammaValues,
+                        betaValues),
+                emptyDictionary());
+    }
 }
