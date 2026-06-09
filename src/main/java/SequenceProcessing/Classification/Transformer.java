@@ -31,7 +31,7 @@ public class Transformer extends ComputationalGraph implements Serializable {
         }
     }
 
-    private Tensor positionalEncoding(Tensor tensor, int wordEmbeddingLength) {
+    protected Tensor positionalEncoding(Tensor tensor, int wordEmbeddingLength) {
         ArrayList<Double> values = new ArrayList<>();
         for (int i = 0; i < tensor.getShape()[0]; i++) {
             for (int j = 0; j < tensor.getShape()[1]; j++) {
@@ -46,7 +46,7 @@ public class Transformer extends ComputationalGraph implements Serializable {
         return new Tensor(values, tensor.getShape());
     }
 
-    private ArrayList<Integer> createInputTensors(Tensor instance, ComputationalNode input1, ComputationalNode input2, int wordEmbeddingLength) {
+    protected ArrayList<Integer> createInputTensors(Tensor instance, ComputationalNode input1, ComputationalNode input2, int wordEmbeddingLength) {
         boolean isOutput = false;
         int curLength = 0;
         ArrayList<Integer> classLabels = new ArrayList<>();
@@ -76,7 +76,7 @@ public class Transformer extends ComputationalGraph implements Serializable {
         return classLabels;
     }
 
-    private ComputationalNode layerNormalization(ComputationalNode input, TransformerParameter parameter, boolean isInput, int[] lnSize) {
+    protected ComputationalNode layerNormalization(ComputationalNode input, TransformerParameter parameter, boolean isInput, int[] lnSize) {
         ArrayList<Double> data = new ArrayList<>();
         ComputationalNode inputC1Mean = this.addEdge(input, new Mean());
         ComputationalNode mean1Minus = this.addEdge(inputC1Mean, new Negation());
@@ -114,7 +114,7 @@ public class Transformer extends ComputationalGraph implements Serializable {
         return this.addAdditionEdge(lnValue1GammaInput1, betaInput1, false);
     }
 
-    private ArrayList<ComputationalNode> multiHeadAttention(ComputationalNode input, TransformerParameter parameter, boolean isMasked, Random random) {
+    protected ArrayList<ComputationalNode> multiHeadAttention(ComputationalNode input, TransformerParameter parameter, boolean isMasked, Random random) {
         ArrayList<ComputationalNode> nodes = new ArrayList<>();
         for (int i = 0; i < parameter.getN(); i++) {
             ComputationalNode wk = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getDk(), random), new int[]{parameter.getL(), parameter.getDk()}));
@@ -139,7 +139,7 @@ public class Transformer extends ComputationalGraph implements Serializable {
         return nodes;
     }
 
-    private ComputationalNode feedforwardNeuralNetwork(ComputationalNode current, int currentLayerSize, TransformerParameter parameter, Random random, boolean isInput) {
+    protected ComputationalNode feedforwardNeuralNetwork(ComputationalNode current, int currentLayerSize, TransformerParameter parameter, Random random, boolean isInput) {
         int size;
         if (isInput) {
             size = parameter.getInputSize();
@@ -239,7 +239,7 @@ public class Transformer extends ComputationalGraph implements Serializable {
         }
     }
 
-    private void setInputNode(int bound, Vector vector, ComputationalNode node) {
+    protected void setInputNode(int bound, Vector vector, ComputationalNode node) {
         ArrayList<Double> data = new ArrayList<>();
         if (node.getValue() != null) {
             data = (ArrayList<Double>) node.getValue().getData();
