@@ -19,6 +19,7 @@ import static org.junit.Assert.fail;
 
 public class BertGoldenTest {
 
+    // Pre-padding-mask baseline was 0.3333333333333333.
     private static final double GOLDEN_ACCURACY = 0.3333333333333333;
 
     @Test
@@ -34,8 +35,7 @@ public class BertGoldenTest {
                     + "GOLDEN_ACCURACY, then re run.");
         }
 
-        assertEquals("Stage 3 changed the trained model's accuracy versus the pre refactor "
-                        + "baseline. An inherited helper silently altered the computation. "
+        assertEquals("Padding-mask train/test accuracy drifted from the pinned golden guard. "
                         + "Investigate before committing.",
                 GOLDEN_ACCURACY, accuracy, 1e-9);
     }

@@ -14,6 +14,7 @@ import SequenceProcessing.Classification.Bert;
 import SequenceProcessing.Parameters.BertParameter;
 import org.junit.Test;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -237,6 +238,62 @@ public class BertTest {
                         selected.size(), distinct.size());
             }
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static int invokeDeriveNspLabel(ArrayList<Integer> segmentIds) throws Exception {
+        Method method = Bert.class.getDeclaredMethod("deriveNspLabel", ArrayList.class);
+        method.setAccessible(true);
+        return (Integer) method.invoke(null, segmentIds);
+    }
+
+    @Test
+    public void testDeriveNspLabel_twoSegmentInstance() throws Exception {
+        assertEquals(1, invokeDeriveNspLabel(new ArrayList<>(Arrays.asList(0, 0, 1, 1))));
+    }
+
+    @Test
+    public void testDeriveNspLabel_singleSegmentInstance() throws Exception {
+        assertEquals(0, invokeDeriveNspLabel(new ArrayList<>(Arrays.asList(0, 0, 0, 0))));
+    }
+
+    @Test
+    public void testPaddedAttentionMaskAllowsMixedLengthInstances() throws Exception {
+        Bert bert = buildInitializationBert();
+        Tensor shortInstance = new Tensor(Arrays.asList(
+                0.2, 0.7, 0.1,
+                0.3, 0.4, 0.8,
+                Double.MAX_VALUE,
+                1.0, 2.0
+        ), new int[]{9});
+        ArrayList<Tensor> tensors = new ArrayList<>();
+        tensors.add(shortInstance);
+        tensors.add(buildInitializationTensors().get(0));
+        bert.train(tensors);
+
+        ArrayList<Tensor> shortOnly = new ArrayList<>();
+        shortOnly.add(shortInstance);
+        assertNotNull(bert.test(shortOnly));
+
+        Field lastMlmRowCountField = Bert.class.getDeclaredField("lastMlmRowCount");
+        lastMlmRowCountField.setAccessible(true);
+        assertEquals("padded instance must record two real token rows", 2, lastMlmRowCountField.getInt(bert));
+        // test() calls predict(), whose getOutputValue() path scores lastMlmRowCount rows only
+    }
+
+    @Test
+    public void testMlmOutputRowCountExcludesNspRow() throws Exception {
+        Bert bert = buildInitializationBert();
+        ArrayList<Tensor> tensors = buildInitializationTensors();
+        bert.train(tensors);
+        ArrayList<Tensor> single = new ArrayList<>();
+        single.add(tensors.get(0));
+        assertNotNull(bert.test(single));
+
+        Field lastMlmRowCountField = Bert.class.getDeclaredField("lastMlmRowCount");
+        lastMlmRowCountField.setAccessible(true);
+        assertEquals("MLM scoring uses token-row count, not the extra NSP output row",
+                4, lastMlmRowCountField.getInt(bert));
     }
 
     @Test

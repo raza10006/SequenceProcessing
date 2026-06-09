@@ -7,7 +7,15 @@ import ComputationalGraph.Node.*;
 import Dictionary.*;
 import Math.Tensor;
 import Math.Vector;
+import SequenceProcessing.Functions.FirstRow;
+import SequenceProcessing.Functions.Mask;
+import SequenceProcessing.Functions.MultiplyByConstant;
+import SequenceProcessing.Functions.NspLogitsPadding;
+import SequenceProcessing.Functions.PaddingAttentionMask;
+import SequenceProcessing.Functions.SelectRow;
+import SequenceProcessing.Functions.Transpose;
 import SequenceProcessing.Parameters.BertParameter;
+import SequenceProcessing.Parameters.TransformerParameter;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -17,6 +25,10 @@ public class Bert extends Transformer {
 
     private final VectorizedDictionary dictionary;
     private final int sepIndex;
+    private int lastMlmRowCount;
+    private int lastNspLabel;
+    private int maxSequenceLength;
+    private final PaddingAttentionMask paddingAttentionMask = new PaddingAttentionMask();
 
     /**
      * Constructs a BERT model from the given parameter bundle and vectorized dictionary,
@@ -63,33 +75,85 @@ public class Bert extends Transformer {
     }
 
     /**
+     * Returns the maximum number of token rows in any packed tensor in {@code tensors},
+     * counting only the embedding rows before the {@link Double#MAX_VALUE} sentinel.
+     */
+    private static int findMaxSequenceLength(ArrayList<Tensor> tensors, int wordEmbeddingLength) {
+        int max = 0;
+        for (Tensor tensor : tensors) {
+            int count = 0;
+            for (int i = 0; i < tensor.getShape()[0]; i++) {
+                if (tensor.getValue(new int[]{i}) == Double.MAX_VALUE) {
+                    break;
+                }
+                count++;
+            }
+            int rows = count / wordEmbeddingLength;
+            if (rows > max) {
+                max = rows;
+            }
+        }
+        return max;
+    }
+
+    /**
+     * Derives the NSP proxy label from the per-row segment ids assigned during parsing.
+     * Returns {@code 1} when at least one token row was assigned segment id {@code 1}
+     * (content after the first {@code [SEP]}), and {@code 0} otherwise.
+     *
+     * This is a <b>structural proxy</b>, not gold next-sentence supervision: the packed
+     * training tensors carry no {@code isNext} bit and no negative-sentence sampling.
+     * @param segmentIds The segment id recorded for each token row before tensors are built.
+     * @return {@code 1} for a detected two-segment instance, {@code 0} for single-segment.
+     */
+    private static int deriveNspLabel(ArrayList<Integer> segmentIds) {
+        for (int sid : segmentIds) {
+            if (sid == 1) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    /**
      * Parses a packed training instance into the BERT word and segment input tensors and
-     * returns the gold token ids that follow the {@link Double#MAX_VALUE} sentinel. Token
-     * embeddings populate {@code wordInput} (with positional encoding applied), while
-     * {@code segmentInput} receives the segment-id tensor whose ids flip at the first
-     * {@code [SEP]} row and whose trailing bias column is held at {@code 0.0}.
+     * returns the gold token ids plus the derived NSP proxy label. Token embeddings populate
+     * {@code wordInput} (with positional encoding applied), while {@code segmentInput}
+     * receives the segment-id tensor whose ids flip at the first {@code [SEP]} row and whose
+     * trailing bias column is held at {@code 0.0}.
      * @param instance The packed input tensor: embedding rows, {@code Double.MAX_VALUE}, then class labels.
      * @param wordInput The graph input node that receives the token embedding tensor.
      * @param segmentInput The graph input node that receives the segment embedding tensor.
      * @param wordEmbeddingLength The width of a single token embedding row.
      * @return The list of gold class labels (one per token row) read from the instance.
+     *         The structural NSP proxy label for the same instance is stored in
+     *         {@link #lastNspLabel} and may be read immediately after this call.
      */
+    @Override
     protected ArrayList<Integer> createInputTensors(Tensor instance, ComputationalNode wordInput, ComputationalNode segmentInput, int wordEmbeddingLength) {
         boolean isOutput = false;
         ArrayList<Integer> classLabels = new ArrayList<>();
         ArrayList<Double> values = new ArrayList<>();
         ArrayList<Integer> segmentIds = new ArrayList<>();
         boolean afterFirstSep = false;
+        int nspLabel = 0;
         int L = wordEmbeddingLength + 1;
         for (int i = 0; i < instance.getShape()[0]; i++) {
             double val = instance.getValue(new int[]{i});
             if (val == Double.MAX_VALUE) {
                 isOutput = true;
                 int rows = values.size() / wordEmbeddingLength;
-                Tensor wordTensor = new Tensor(values, new int[]{rows, wordEmbeddingLength});
+                nspLabel = deriveNspLabel(segmentIds);
+                while (values.size() < maxSequenceLength * wordEmbeddingLength) {
+                    for (int p = 0; p < wordEmbeddingLength; p++) {
+                        values.add(0.0);
+                    }
+                    segmentIds.add(0);
+                }
+                Tensor wordTensor = new Tensor(values, new int[]{maxSequenceLength, wordEmbeddingLength});
                 wordInput.setValue(positionalEncoding(wordTensor, wordEmbeddingLength));
                 ArrayList<Double> segFlat = new ArrayList<>();
-                for (int r = 0; r < rows; r++) {
+                for (int r = 0; r < maxSequenceLength; r++) {
                     int sid = r < segmentIds.size() ? segmentIds.get(r) : 0;
                     double segValue = (sid == 0) ? -0.05 : 0.05;
                     for (int c = 0; c < wordEmbeddingLength; c++) {
@@ -97,7 +161,7 @@ public class Bert extends Transformer {
                     }
                     segFlat.add(0.0);
                 }
-                segmentInput.setValue(new Tensor(segFlat, new int[]{rows, L}));
+                segmentInput.setValue(new Tensor(segFlat, new int[]{maxSequenceLength, L}));
                 values.clear();
                 segmentIds.clear();
                 afterFirstSep = false;
@@ -115,7 +179,45 @@ public class Bert extends Transformer {
                 }
             }
         }
+        lastMlmRowCount = classLabels.size();
+        lastNspLabel = nspLabel;
+        paddingAttentionMask.setValidLength(lastMlmRowCount);
         return classLabels;
+    }
+
+    /**
+     * Bidirectional multi-head self-attention with per-instance padding mask on the
+     * pre-softmax scores. Padded rows/columns (index {@code >=} the real token count
+     * tracked in {@link #lastMlmRowCount}) receive additive {@code -30.0} so they do
+     * not attend to or receive attention from real tokens. When every row is real
+     * ({@code validLength == maxSequenceLength}), the map is identical to the parent
+     * unmasked path.
+     */
+    @Override
+    protected ArrayList<ComputationalNode> multiHeadAttention(ComputationalNode input, TransformerParameter parameter, boolean isMasked, Random random) {
+        ArrayList<ComputationalNode> nodes = new ArrayList<>();
+        for (int i = 0; i < parameter.getN(); i++) {
+            ComputationalNode wk = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getDk(), random), new int[]{parameter.getL(), parameter.getDk()}));
+            ComputationalNode k = this.addEdge(input, wk);
+            ComputationalNode wq = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getDk(), random), new int[]{parameter.getL(), parameter.getDk()}));
+            ComputationalNode q = this.addEdge(input, wq);
+            ComputationalNode wv = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getDk(), random), new int[]{parameter.getL(), parameter.getDk()}));
+            ComputationalNode v = this.addEdge(input, wv);
+            ComputationalNode kTranspose = this.addEdge(k, new Transpose());
+            ComputationalNode qk = this.addEdge(q, kTranspose, false, false);
+            ComputationalNode qkDk = this.addEdge(qk, new MultiplyByConstant(1.0 / Math.sqrt(parameter.getDk())));
+            ComputationalNode sQkDk;
+            if (isMasked) {
+                ComputationalNode mQkDk = this.addEdge(qkDk, new Mask());
+                sQkDk = this.addEdge(mQkDk, new Softmax());
+            } else {
+                ComputationalNode paddedQkDk = this.addEdge(qkDk, paddingAttentionMask);
+                sQkDk = this.addEdge(paddedQkDk, new Softmax());
+            }
+            ComputationalNode attention = this.addEdge(sQkDk, v);
+            nodes.add(attention);
+        }
+        return nodes;
     }
 
     /**
@@ -171,41 +273,13 @@ public class Bert extends Transformer {
     }
 
     /**
-     * Builds the standard BERT Next Sentence Prediction (NSP) sub-graph.
+     * Builds the pre-softmax BERT Next Sentence Prediction (NSP) sub-graph from a
+     * {@code [CLS]} row of the final encoder output.
      *
-     * NSP is the second of BERT's two pre-training objectives (the first being Masked
-     * Language Modeling, MLM). Given a packed pair of sentences {@code [CLS] A [SEP] B [SEP]},
-     * NSP asks the model to decide whether sentence B is the actual sentence that follows
-     * sentence A in the source corpus, or a random sentence drawn from elsewhere. It is a
-     * simple binary classification task whose only purpose during pre-training is to push
-     * the encoder towards producing a pooled sentence-pair representation in the {@code [CLS]}
-     * position that captures inter-sentence coherence.
-     *
-     * The standard recipe, mirrored here, is:
-     * <ol>
-     *   <li>Take the final encoder output at row 0 (the {@code [CLS]} token),
-     *       a single biased row of shape {@code [1, L]}.</li>
-     *   <li><b>Pooler</b>: a learnable linear projection of shape {@code [L, L]} followed by
-     *       a {@link Tanh} activation. Following the {@code addEdge(node, function, true)}
-     *       convention used elsewhere in this file, the activation appends a bias column,
-     *       so the pooled representation has shape {@code [1, L + 1]}.</li>
-     *   <li><b>2-class projection</b>: a learnable linear projection of shape
-     *       {@code [L + 1, 2]} producing logits of shape {@code [1, 2]} (isNext / notNext).</li>
-     *   <li><b>Softmax</b>: applied over the two-class axis to yield NSP probabilities.</li>
-     * </ol>
-     *
-     * <b>Why this method is defined but never wired into the live graph:</b> the
-     * {@link ComputationalGraph} base class exposes a single {@code outputNode} and a single
-     * loss target per graph. The MLM head built in {@link #train(ArrayList)} already occupies
-     * that output with a per-token {@code [r, V]} distribution. Adding NSP as a second live
-     * head would mean either overwriting {@code outputNode} (silently disabling MLM) or
-     * attempting to backpropagate through two output heads under one loss, both of which
-     * break the framework's contract. Real BERT pre-training combines MLM and NSP losses,
-     * but with the current single-head computational graph that is not expressible in one
-     * pass, so MLM remains the active head and this method is provided as a documented,
-     * self-contained construction of the NSP sub-graph (e.g. for future multi-head support
-     * or for callers that want to wire NSP as the sole objective in a separate {@code Bert}
-     * instance). It is intentionally not invoked from {@link #train(ArrayList)}.
+     * The sub-graph is: pooler {@code [L, L]} → {@link Tanh} (with bias) → projection
+     * {@code [L + 1, 2]} producing logits of shape {@code [1, 2]} (isNext / notNext).
+     * No {@link Softmax} is applied here; the caller pads and concatenates these logits
+     * with the MLM head under a single row-wise {@link Softmax} in {@link #train(ArrayList)}.
      *
      * @param clsRepresentation the {@code [CLS]} row of the final encoder output, expected
      *                          to be a biased {@code [1, L]} node produced by the caller.
@@ -213,16 +287,14 @@ public class Bert extends Transformer {
      *                          initialization.
      * @param random            the seeded RNG used for weight initialization, shared with
      *                          the rest of the graph for reproducibility.
-     * @return the NSP softmax node of shape {@code [1, 2]}; the caller is responsible for
-     *         deciding whether to attach it as a loss target.
+     * @return the NSP logits node of shape {@code [1, 2]} (pre-softmax).
      */
-    private ComputationalNode nextSentencePrediction(ComputationalNode clsRepresentation, BertParameter parameter, Random random) {
+    private ComputationalNode nextSentencePredictionLogits(ComputationalNode clsRepresentation, BertParameter parameter, Random random) {
         ComputationalNode poolerWeight = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getL(), random), new int[]{parameter.getL(), parameter.getL()}));
         ComputationalNode pooled = this.addEdge(clsRepresentation, poolerWeight);
         ComputationalNode pooledTanh = this.addEdge(pooled, new Tanh(), true);
         ComputationalNode projectionWeight = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL() + 1, 2, random), new int[]{parameter.getL() + 1, 2}));
-        ComputationalNode logits = this.addEdge(pooledTanh, projectionWeight);
-        return this.addEdge(logits, new Softmax());
+        return this.addEdge(pooledTanh, projectionWeight);
     }
 
     /**
@@ -251,16 +323,28 @@ public class Bert extends Transformer {
     /**
      * Builds the full BERT encoder graph (token + segment + positional input,
      * {@code numEncoderLayers} stacked bidirectional self-attention blocks each with
-     * Add &amp; LayerNorm, FFN, and another Add &amp; LayerNorm, then the MLM head) and
-     * trains it for {@code parameter.getEpoch()} epochs. For each instance ~15% of the
-     * token positions are picked by {@link #selectMaskedPositions} and only those rows
-     * receive a one-hot gold target, so the MLM cross-entropy loss is computed solely
-     * at masked positions.
+     * Add &amp; LayerNorm, FFN, and another Add &amp; LayerNorm) and trains it for
+     * {@code parameter.getEpoch()} epochs with <b>joint MLM + NSP</b> under the framework's
+     * single-{@code outputNode}/single-loss contract.
+     *
+     * <p>MLM: ~15% of token positions are masked via {@link #selectMaskedPositions}; only
+     * masked rows receive a one-hot gold target. NSP: the final row of the joint
+     * {@code [r+1, V]} output is the padded NSP head; its gold target is a 2-class one-hot
+     * in columns {@code 0} (isNext) and {@code 1} (notNext). The NSP label is a
+     * <b>structural proxy</b> from segment detection (segment id {@code 1} present or not),
+     * not corpus-level next-sentence supervision.</p>
+     *
+     * <p>Graph wiring: MLM logits {@code [r, V]} and NSP logits padded to {@code [1, V]}
+     * are concatenated along dim {@code 0}, then a single row-wise {@link Softmax} forms
+     * {@code outputNode}.</p>
+     *
      * @param trainSet The list of packed training tensors; each is shuffled and consumed once per epoch.
      */
     @Override
     public void train(ArrayList<Tensor> trainSet) {
         BertParameter parameter = (BertParameter) this.parameters;
+        int wordEmbeddingLength = parameter.getL() - 1;
+        maxSequenceLength = findMaxSequenceLength(trainSet, wordEmbeddingLength);
         int[] lnSize = new int[4];
         Random random = new Random(parameter.getSeed());
         // Token + positional embeddings come in via wordInput (biased: framework appends a 1.0 column making it [r, L]).
@@ -282,16 +366,28 @@ public class Bert extends Transformer {
             ComputationalNode ffResidual = this.addAdditionEdge(ff, y, false);
             current = layerNormalization(ffResidual, parameter, true, lnSize);
         }
-        // MLM head: project the encoder output [r, L] to [r, V] and softmax over the vocabulary for each position.
+        // Joint MLM + NSP head under a single Softmax (single-output / single-loss contract).
+        // Each MLM row and the NSP row are separate [1, V] parents so concat backward splits
+        // evenly (the framework assumes equal blocks along the concat dimension).
         ComputationalNode wMlm = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getV(), random), new int[]{parameter.getL(), parameter.getV()}));
-        ComputationalNode mlmLogits = this.addEdge(current, wMlm);
-        this.outputNode = this.addEdge(mlmLogits, new Softmax());
+        ArrayList<ComputationalNode> jointParents = new ArrayList<>();
+        for (int k = 0; k < maxSequenceLength; k++) {
+            ComputationalNode rowK = this.addEdge(current, new SelectRow(k));
+            jointParents.add(this.addEdge(rowK, wMlm));
+        }
+        ComputationalNode clsRow = this.addEdge(current, new FirstRow());
+        ComputationalNode nspLogits = nextSentencePredictionLogits(clsRow, parameter, random);
+        ComputationalNode nspPadded = this.addEdge(nspLogits, new NspLogitsPadding(parameter.getV()));
+        jointParents.add(nspPadded);
+        ComputationalNode jointLogits = this.concatEdges(jointParents, 0);
+        this.outputNode = this.addEdge(jointLogits, new Softmax());
         ComputationalNode classLabelNode = new ComputationalNode();
         this.addLoss(classLabelNode);
         for (int i = 0; i < parameter.getEpoch(); i++) {
             this.shuffle(trainSet, random);
             for (Tensor instance : trainSet) {
                 ArrayList<Integer> classLabels = createInputTensors(instance, this.inputNodes.get(0), this.inputNodes.get(1), parameter.getL() - 1);
+                int nspLabel = lastNspLabel;
                 // MLM masking: pick ~15% of token positions to mask and only those positions
                 // contribute to the loss. We realize this within the framework's single-loss
                 // contract by setting the one-hot gold for masked rows and leaving non-masked
@@ -301,18 +397,35 @@ public class Bert extends Transformer {
                 ArrayList<Integer> maskedPositions = selectMaskedPositions(classLabels.size(), random);
                 HashSet<Integer> maskedSet = new HashSet<>(maskedPositions);
                 ArrayList<Double> classLabelValues = new ArrayList<>();
-                for (int row = 0; row < classLabels.size(); row++) {
-                    boolean masked = maskedSet.contains(row);
-                    int classLabel = classLabels.get(row);
-                    for (int j = 0; j < parameter.getV(); j++) {
-                        if (masked && j == classLabel) {
-                            classLabelValues.add(1.0);
-                        } else {
+                for (int row = 0; row < maxSequenceLength; row++) {
+                    if (row < classLabels.size()) {
+                        boolean masked = maskedSet.contains(row);
+                        int classLabel = classLabels.get(row);
+                        for (int j = 0; j < parameter.getV(); j++) {
+                            if (masked && j == classLabel) {
+                                classLabelValues.add(1.0);
+                            } else {
+                                classLabelValues.add(0.0);
+                            }
+                        }
+                    } else {
+                        for (int j = 0; j < parameter.getV(); j++) {
                             classLabelValues.add(0.0);
                         }
                     }
                 }
-                classLabelNode.setValue(new Tensor(classLabelValues, new int[]{classLabels.size(), parameter.getV()}));
+                // NSP gold row (structural proxy: segment id 1 present => isNext in column 0).
+                // The packed tensors carry no true isNext bit and no negative-sentence sampling.
+                for (int j = 0; j < parameter.getV(); j++) {
+                    if (j == 0 && nspLabel == 1) {
+                        classLabelValues.add(1.0);
+                    } else if (j == 1 && nspLabel == 0) {
+                        classLabelValues.add(1.0);
+                    } else {
+                        classLabelValues.add(0.0);
+                    }
+                }
+                classLabelNode.setValue(new Tensor(classLabelValues, new int[]{maxSequenceLength + 1, parameter.getV()}));
                 this.forwardCalculation();
                 this.backpropagation();
             }
@@ -323,7 +436,8 @@ public class Bert extends Transformer {
     /**
      * Evaluates the trained model on a held-out set of packed tensors, comparing the
      * per-token argmax predictions against the gold labels embedded in each instance
-     * and returning the resulting classification accuracy.
+     * and returning the resulting classification accuracy. The extra NSP output row is
+     * excluded from MLM scoring.
      * @param testSet The list of packed test tensors in the same layout as the training set.
      * @return The classification performance whose accuracy is in {@code [0.0, 1.0]}.
      */
@@ -351,14 +465,16 @@ public class Bert extends Transformer {
 
     /**
      * Reads the current value of the output node and returns the per-row argmax over the
-     * vocabulary axis, i.e. the predicted token id for each position in the sequence.
-     * @return A list of predicted class indices, one per row of the output tensor.
+     * vocabulary axis for the MLM token rows only (rows {@code 0 .. r-1}), excluding the
+     * trailing NSP row at index {@code r}.
+     * @return A list of predicted class indices, one per MLM token row.
      */
     @Override
     protected ArrayList<Double> getOutputValue() {
         ArrayList<Double> classLabels = new ArrayList<>();
         Tensor value = outputNode.getValue();
-        for (int i = 0; i < value.getShape()[0]; i++) {
+        int mlmRows = lastMlmRowCount;
+        for (int i = 0; i < mlmRows; i++) {
             double max = -Double.MAX_VALUE;
             double index = -1;
             for (int j = 0; j < value.getShape()[1]; j++) {
