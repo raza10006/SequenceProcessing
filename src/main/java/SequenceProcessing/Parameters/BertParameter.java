@@ -1,22 +1,13 @@
 package SequenceProcessing.Parameters;
 
 import ComputationalGraph.Initialization.Initialization;
-import ComputationalGraph.NeuralNetworkParameter;
 
 import java.io.Serializable;
 import java.util.ArrayList;
 
-public class BertParameter extends NeuralNetworkParameter implements Serializable {
+public class BertParameter extends TransformerParameter implements Serializable {
 
-    private final int L;
-    private final int N;
-    private final int V;
     private final int numEncoderLayers;
-    private final double epsilon;
-    private final ArrayList<Integer> feedForwardHiddenLayers;
-    private final ArrayList<Object> activationFunctions;
-    private final ArrayList<Double> gammaValues;
-    private final ArrayList<Double> betaValues;
 
     /**
      * Constructs the parameter bundle for a {@code Bert} model.
@@ -36,16 +27,20 @@ public class BertParameter extends NeuralNetworkParameter implements Serializabl
      * @param betaValues The per-LayerNorm beta shift values, consumed in order.
      */
     public BertParameter(int seed, int epoch, ComputationalGraph.Optimizer.Optimizer optimizer, Initialization initialization, ComputationalGraph.Loss.Loss loss, int wordEmbeddingLength, int multiHeadAttentionLength, int vocabularyLength, int numEncoderLayers, double epsilon, ArrayList<Integer> feedForwardHiddenLayers, ArrayList<Object> activationFunctions, ArrayList<Double> gammaValues, ArrayList<Double> betaValues) {
-        super(seed, epoch, optimizer, initialization, loss, 0.0, -1);
-        this.L = wordEmbeddingLength + 1;
-        this.N = multiHeadAttentionLength;
-        this.V = vocabularyLength;
+        // BERT keeps a single set of layer / activation / gamma / beta values, whereas the parent
+        // TransformerParameter models a separate encoder (input) and decoder (output) split. We
+        // therefore pass the single BERT list for BOTH the input and output parameters so the parent
+        // is fully initialized and every inherited getter returns BERT's values. The shared scalars
+        // (wordEmbeddingLength, multiHeadAttentionLength, vocabularyLength, epsilon) map one-to-one;
+        // the parent derives L = wordEmbeddingLength + 1 just as BERT did before.
+        super(seed, epoch, optimizer, initialization, loss,
+                wordEmbeddingLength, multiHeadAttentionLength, vocabularyLength, epsilon,
+                feedForwardHiddenLayers, feedForwardHiddenLayers,
+                activationFunctions, activationFunctions,
+                gammaValues, gammaValues,
+                betaValues, betaValues);
+        // numEncoderLayers is BERT-native (no equivalent on TransformerParameter), so it stays here.
         this.numEncoderLayers = numEncoderLayers;
-        this.epsilon = epsilon;
-        this.feedForwardHiddenLayers = feedForwardHiddenLayers;
-        this.activationFunctions = activationFunctions;
-        this.gammaValues = gammaValues;
-        this.betaValues = betaValues;
     }
 
     /**
@@ -55,7 +50,9 @@ public class BertParameter extends NeuralNetworkParameter implements Serializabl
      * @return The gamma value at {@code index}.
      */
     public double getGammaValue(int index) {
-        return gammaValues.get(index);
+        // BERT uses one gamma list; delegate to the parent's input-side accessor, which holds
+        // that same list (passed for both input and output in the constructor).
+        return getGammaInputValue(index);
     }
 
     /**
@@ -65,47 +62,9 @@ public class BertParameter extends NeuralNetworkParameter implements Serializabl
      * @return The beta value at {@code index}.
      */
     public double getBetaValue(int index) {
-        return betaValues.get(index);
-    }
-
-    /**
-     * Returns the numerical-stability constant added inside the LayerNorm denominator.
-     * @return The {@code epsilon} value.
-     */
-    public double getEpsilon() {
-        return epsilon;
-    }
-
-    /**
-     * Returns the per-head key/query/value dimension, computed as {@code L / N}.
-     * @return The dimensionality {@code dk} of a single attention head.
-     */
-    public int getDk() {
-        return L / N;
-    }
-
-    /**
-     * Returns the biased embedding width, i.e. {@code wordEmbeddingLength + 1}.
-     * @return The width {@code L} used throughout the encoder graph.
-     */
-    public int getL() {
-        return L;
-    }
-
-    /**
-     * Returns the number of parallel self-attention heads.
-     * @return The number of heads {@code N}.
-     */
-    public int getN() {
-        return N;
-    }
-
-    /**
-     * Returns the vocabulary size used by the MLM output head.
-     * @return The vocabulary size {@code V}.
-     */
-    public int getV() {
-        return V;
+        // BERT uses one beta list; delegate to the parent's input-side accessor, which holds
+        // that same list (passed for both input and output in the constructor).
+        return getBetaInputValue(index);
     }
 
     /**
@@ -122,7 +81,8 @@ public class BertParameter extends NeuralNetworkParameter implements Serializabl
      * @return The width of the FFN hidden layer at {@code index}.
      */
     public int getFeedForwardHiddenLayer(int index) {
-        return feedForwardHiddenLayers.get(index);
+        // BERT's single FFN spec is stored as the parent's input-side hidden-layer list.
+        return getInputHiddenLayer(index);
     }
 
     /**
@@ -131,7 +91,8 @@ public class BertParameter extends NeuralNetworkParameter implements Serializabl
      * @return The activation function at {@code index}.
      */
     public Object getActivationFunction(int index) {
-        return activationFunctions.get(index);
+        // BERT's single FFN spec is stored as the parent's input-side activation list.
+        return getInputActivationFunction(index);
     }
 
     /**
@@ -139,6 +100,7 @@ public class BertParameter extends NeuralNetworkParameter implements Serializabl
      * @return The FFN depth.
      */
     public int getFeedForwardSize() {
-        return feedForwardHiddenLayers.size();
+        // BERT's single FFN spec is stored as the parent's input-side hidden-layer list.
+        return getInputSize();
     }
 }
