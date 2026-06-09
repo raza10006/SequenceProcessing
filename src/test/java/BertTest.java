@@ -166,7 +166,7 @@ public class BertTest {
     @SuppressWarnings("unchecked")
     private static ArrayList<Integer> invokeSelectMaskedPositions(int sequenceLength, Random random) throws Exception {
         // Reflection: selectMaskedPositions is a private static helper inside Bert (kept private
-        // to match the class's other internal helpers like nextSentencePrediction). The test
+        // to match the class's other internal helpers like nextSentencePredictionLogits). The test
         // accesses it directly to assert the masking-policy invariants the architecture relies on.
         Method method = Bert.class.getDeclaredMethod("selectMaskedPositions", int.class, Random.class);
         method.setAccessible(true);
