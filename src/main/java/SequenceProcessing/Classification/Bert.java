@@ -7,15 +7,13 @@ import ComputationalGraph.Node.*;
 import Dictionary.*;
 import Math.Tensor;
 import Math.Vector;
-import SequenceProcessing.Functions.*;
 import SequenceProcessing.Parameters.BertParameter;
 
-import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Random;
 
-public class Bert extends ComputationalGraph implements Serializable {
+public class Bert extends Transformer {
 
     private final VectorizedDictionary dictionary;
     private final int sepIndex;
@@ -27,7 +25,7 @@ public class Bert extends ComputationalGraph implements Serializable {
      * @param dictionary The vectorized dictionary used to look up the {@code [SEP]} entry.
      */
     public Bert(NeuralNetworkParameter parameter, VectorizedDictionary dictionary) {
-        super(parameter);
+        super(parameter, dictionary);
         this.dictionary = dictionary;
         int sep = -1;
         for (int k = 0; k < this.dictionary.size(); k++) {
@@ -37,29 +35,6 @@ public class Bert extends ComputationalGraph implements Serializable {
             }
         }
         this.sepIndex = sep;
-    }
-
-    /**
-     * Adds the standard sinusoidal positional encoding to a token embedding tensor.
-     * Even feature columns receive a sine offset and odd columns a cosine offset, both
-     * scaled by the canonical {@code 10000^(2i/d)} frequency.
-     * @param tensor The token embedding tensor of shape {@code [r, wordEmbeddingLength]}.
-     * @param wordEmbeddingLength The width of the embedding dimension.
-     * @return A new tensor of the same shape with the positional encoding added pointwise.
-     */
-    private Tensor positionalEncoding(Tensor tensor, int wordEmbeddingLength) {
-        ArrayList<Double> values = new ArrayList<>();
-        for (int i = 0; i < tensor.getShape()[0]; i++) {
-            for (int j = 0; j < tensor.getShape()[1]; j++) {
-                double val = tensor.getValue(new int[]{i, j});
-                if (j % 2 == 0) {
-                    values.add(val + Math.sin((i + 1.0) / Math.pow(10000, (j + 0.0) / wordEmbeddingLength)));
-                } else {
-                    values.add(val + Math.cos((i + 1.0) / Math.pow(10000, (j - 1.0) / wordEmbeddingLength)));
-                }
-            }
-        }
-        return new Tensor(values, tensor.getShape());
     }
 
     /**
@@ -99,7 +74,7 @@ public class Bert extends ComputationalGraph implements Serializable {
      * @param wordEmbeddingLength The width of a single token embedding row.
      * @return The list of gold class labels (one per token row) read from the instance.
      */
-    private ArrayList<Integer> createInputTensors(Tensor instance, ComputationalNode wordInput, ComputationalNode segmentInput, int wordEmbeddingLength) {
+    protected ArrayList<Integer> createInputTensors(Tensor instance, ComputationalNode wordInput, ComputationalNode segmentInput, int wordEmbeddingLength) {
         boolean isOutput = false;
         ArrayList<Integer> classLabels = new ArrayList<>();
         ArrayList<Double> values = new ArrayList<>();
@@ -144,86 +119,12 @@ public class Bert extends ComputationalGraph implements Serializable {
     }
 
     /**
-     * Builds the LayerNorm sub-graph on top of the given input node: subtracts the row
-     * mean, divides by the square root of the row variance plus {@code epsilon}, then
-     * applies a learnable {@code gamma} scale and {@code beta} shift. The {@code gamma}
-     * and {@code beta} rows are pulled from {@link BertParameter} via the {@code lnSize}
-     * counters so each LayerNorm call site consumes its own pair.
-     * @param input The input node to normalize.
-     * @param parameter The BERT parameter bundle supplying {@code epsilon}, {@code L}, gamma and beta.
-     * @param lnSize Two-element counter array tracking how many gamma and beta rows have been consumed.
-     * @return The output node of the LayerNorm sub-graph.
-     */
-    private ComputationalNode layerNormalization(ComputationalNode input, BertParameter parameter, int[] lnSize) {
-        ArrayList<Double> data = new ArrayList<>();
-        ComputationalNode inputMean = this.addEdge(input, new Mean());
-        ComputationalNode meanMinus = this.addEdge(inputMean, new Negation());
-        ComputationalNode centered = this.addAdditionEdge(input, meanMinus, false);
-        ComputationalNode variance = this.addEdge(centered, new Variance());
-        ComputationalNode rootVariance = this.addEdge(variance, new SquareRoot(parameter.getEpsilon()));
-        ComputationalNode inverseRootVariance = this.addEdge(rootVariance, new Inverse());
-        ComputationalNode normalized = this.addEdge(centered, inverseRootVariance, false, true);
-        for (int j = 0; j < parameter.getL(); j++) {
-            data.add(parameter.getGammaValue(lnSize[0]));
-        }
-        lnSize[0]++;
-        ComputationalNode gammaNode = new MultiplicationNode(true, false, new Tensor(data, new int[]{1, parameter.getL()}), true);
-        ComputationalNode scaled = this.addEdge(normalized, gammaNode);
-        data = new ArrayList<>();
-        for (int j = 0; j < parameter.getL(); j++) {
-            data.add(parameter.getBetaValue(lnSize[1]));
-        }
-        lnSize[1]++;
-        ComputationalNode betaNode = new ComputationalNode(true, false, new Tensor(data, new int[]{1, parameter.getL()}));
-        return this.addAdditionEdge(scaled, betaNode, false);
-    }
-
-    /**
-     * Builds the {@code N} parallel self-attention heads for one encoder block. Each
-     * head learns its own {@code Wk}, {@code Wq}, {@code Wv} of shape {@code [L, dk]}
-     * and computes {@code softmax(QKᵀ / sqrt(dk)) · V}. The attention is unmasked, so
-     * every position attends bidirectionally to every other position.
-     * @param input The shared input node fed to all heads.
-     * @param parameter The BERT parameter bundle supplying {@code N}, {@code L} and {@code dk}.
-     * @param random The seeded RNG used to initialize the per-head weights.
-     * @return The list of {@code N} attention head output nodes, ready to be concatenated.
-     */
-    private ArrayList<ComputationalNode> multiHeadAttention(ComputationalNode input, BertParameter parameter, Random random) {
-        ArrayList<ComputationalNode> nodes = new ArrayList<>();
-        for (int i = 0; i < parameter.getN(); i++) {
-            ComputationalNode wk = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getDk(), random), new int[]{parameter.getL(), parameter.getDk()}));
-            ComputationalNode k = this.addEdge(input, wk);
-            ComputationalNode wq = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getDk(), random), new int[]{parameter.getL(), parameter.getDk()}));
-            ComputationalNode q = this.addEdge(input, wq);
-            ComputationalNode wv = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getDk(), random), new int[]{parameter.getL(), parameter.getDk()}));
-            ComputationalNode v = this.addEdge(input, wv);
-            ComputationalNode kTranspose = this.addEdge(k, new Transpose());
-            ComputationalNode qk = this.addEdge(q, kTranspose, false, false);
-            ComputationalNode qkDk = this.addEdge(qk, new MultiplyByConstant(1.0 / Math.sqrt(parameter.getDk())));
-            ComputationalNode sQkDk = this.addEdge(qkDk, new Softmax());
-            ComputationalNode attention = this.addEdge(sQkDk, v);
-            nodes.add(attention);
-        }
-        return nodes;
-    }
-
-    /**
      * Selects the token positions that participate in the Masked Language Modeling
      * (MLM) loss for a single training instance.
      *
      * Real BERT pre-training picks roughly 15% of the input token positions uniformly
      * at random and only those positions contribute to the MLM cross-entropy loss; the
-     * remaining 85% of positions are ignored by the loss. The original paper further
-     * perturbs the input embeddings at the selected positions with the canonical
-     * 80/10/10 split: 80% of the chosen positions are replaced with the {@code [MASK]}
-     * token vector, 10% are replaced with a random vocabulary item, and 10% are kept
-     * unchanged. This helper implements the position-selection step (which positions
-     * get masked); the 80/10/10 input-perturbation step is left as a documented
-     * simplification because applying it cleanly would require a populated
-     * {@code [MASK]} entry in the {@link VectorizedDictionary} (the existing tests use
-     * either an empty dictionary or one without {@code [MASK]}) plus invasive changes
-     * to {@link #createInputTensors(Tensor, ComputationalNode, ComputationalNode, int)}
-     * to substitute embedding rows on a per-position basis. Position-level masking on
+     * remaining 85% of positions are ignored by the loss. Position-level masking on
      * the loss path is the part that materially changes the training objective and is
      * what the architecture diagram explicitly calls out.
      *
@@ -360,7 +261,7 @@ public class Bert extends ComputationalGraph implements Serializable {
     @Override
     public void train(ArrayList<Tensor> trainSet) {
         BertParameter parameter = (BertParameter) this.parameters;
-        int[] lnSize = new int[]{0, 0};
+        int[] lnSize = new int[4];
         Random random = new Random(parameter.getSeed());
         // Token + positional embeddings come in via wordInput (biased: framework appends a 1.0 column making it [r, L]).
         ComputationalNode wordInput = new MultiplicationNode(false, true);
@@ -372,14 +273,14 @@ public class Bert extends ComputationalGraph implements Serializable {
         ComputationalNode current = embedded;
         // N stacked encoder blocks, each: bidirectional self-attention -> Add & LayerNorm -> FFN -> Add & LayerNorm.
         for (int layer = 0; layer < parameter.getNumEncoderLayers(); layer++) {
-            ConcatenatedNode concatenatedNode = (ConcatenatedNode) this.concatEdges(multiHeadAttention(current, parameter, random), 1);
+            ConcatenatedNode concatenatedNode = (ConcatenatedNode) this.concatEdges(multiHeadAttention(current, parameter, false, random), 1);
             ComputationalNode wo = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getL(), random), new int[]{parameter.getL(), parameter.getL()}));
             ComputationalNode c = this.addEdge(concatenatedNode, wo);
             ComputationalNode inputC = this.addAdditionEdge(current, c, false);
-            ComputationalNode y = layerNormalization(inputC, parameter, lnSize);
+            ComputationalNode y = layerNormalization(inputC, parameter, true, lnSize);
             ComputationalNode ff = feedForwardNetwork(y, parameter.getL(), parameter, random);
             ComputationalNode ffResidual = this.addAdditionEdge(ff, y, false);
-            current = layerNormalization(ffResidual, parameter, lnSize);
+            current = layerNormalization(ffResidual, parameter, true, lnSize);
         }
         // MLM head: project the encoder output [r, L] to [r, V] and softmax over the vocabulary for each position.
         ComputationalNode wMlm = new MultiplicationNode(new Tensor(parameter.initializeWeights(parameter.getL(), parameter.getV(), random), new int[]{parameter.getL(), parameter.getV()}));
