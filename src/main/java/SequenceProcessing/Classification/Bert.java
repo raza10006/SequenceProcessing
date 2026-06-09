@@ -297,8 +297,7 @@ public class Bert extends Transformer {
                 // contract by setting the one-hot gold for masked rows and leaving non-masked
                 // rows as all zeros, which makes their cross-entropy contribution exactly 0
                 // (and therefore their gradient contribution 0 as well). See selectMaskedPositions
-                // for the 15% / floor-of-1 convention and for the noted simplification of the
-                // canonical 80/10/10 input-perturbation split.
+                // for the 15% / floor-of-1 convention.
                 ArrayList<Integer> maskedPositions = selectMaskedPositions(classLabels.size(), random);
                 HashSet<Integer> maskedSet = new HashSet<>(maskedPositions);
                 ArrayList<Double> classLabelValues = new ArrayList<>();
