@@ -2,10 +2,9 @@ package SequenceProcessing.Parameters;
 
 import ComputationalGraph.Initialization.Initialization;
 
-import java.io.Serializable;
 import java.util.ArrayList;
 
-public class BertParameter extends TransformerParameter implements Serializable {
+public class BertParameter extends TransformerParameter {
 
     private final int numEncoderLayers;
 
